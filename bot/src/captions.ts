@@ -45,74 +45,57 @@ export async function attachCaptionObserver(
   await enableCaptions(page);
 
   await page.evaluate(
-    ({ containerSel, speakerBadgeSel, textNodeSel }) => {
-      type Tracked = { speaker: string; lastText: string; lastAt: number };
-      const seen = new WeakMap<Element, Tracked>();
-
-      // Recall.ai's carry-forward pattern: continuation rows may omit the
-      // speaker badge, so we remember the most-recently-named speaker and
-      // attribute unbadged rows to them.
+    ({ regionSel, speakerBadgeSel, textNodeSel }) => {
+      // Dedup per DOM row, not per speaker. Meet keeps old rows in the panel
+      // for many seconds; a speaker-keyed dedup made both rows "look new" to
+      // each other on every mutation, and collapsed their tStart timestamps
+      // onto one — which in turn caused Q1's row to clobber Q2's text in
+      // the accumulator.
+      const seenByRow = new WeakMap<Element, { text: string; firstAt: number }>();
       let lastNamedSpeaker = "";
       let sentFirstHtml = false;
 
-      // Skip screen-reader-only / hidden a11y announcer divs — they have
-      // `aria-live` but aren't the real caption area.
-      function isA11yAnnouncer(el: Element): boolean {
-        if (el.getAttribute("data-mdc-dom-announce") !== null) return true;
-        const style = (el as HTMLElement).style;
-        if (
-          style &&
-          (style.position === "absolute" && (style.top === "-9999px" || style.left === "-9999px"))
-        ) {
-          return true;
+      function findRegion(): Element | null {
+        for (const sel of regionSel.split(",").map((s: string) => s.trim())) {
+          const el = document.querySelector(sel);
+          if (el) return el;
         }
-        const rect = (el as HTMLElement).getBoundingClientRect?.();
-        if (rect && rect.width <= 1 && rect.height <= 1) return true;
-        return false;
+        return null;
       }
 
-      function findContainer(): Element | null {
-        // 1) Prefer a container that actually holds caption rows — i.e.
-        //    contains a speaker-badge element. Walk up from the badge.
-        const badge = document.querySelector(speakerBadgeSel);
-        if (badge) {
-          // The caption container is a few ancestors up from a badge.
-          // Walk up until we find an element with several children
-          // (real caption rows accumulate siblings).
+      /**
+       * Structural row finder: any ancestor (inside the captions region)
+       * that contains BOTH a speaker badge AND a text body. This avoids
+       * hard-coding Meet's obfuscated class names like "nMcdL" — those
+       * change regularly — and also avoids accidentally treating the
+       * "Jump to bottom" button as a row.
+       */
+      function findRows(region: Element): Element[] {
+        const badges = Array.from(region.querySelectorAll(speakerBadgeSel));
+        const rows: Element[] = [];
+        const seenRows = new WeakSet<Element>();
+        for (const badge of badges) {
           let cur: Element | null = badge.parentElement;
-          for (let i = 0; i < 8 && cur; i++) {
-            if (cur.children.length >= 1 && !isA11yAnnouncer(cur)) {
-              // Bubble up a bit more to land on the row-list parent.
-              if (cur.parentElement && cur.parentElement.children.length >= 1
-                  && !isA11yAnnouncer(cur.parentElement)) {
-                return cur.parentElement;
+          while (cur && cur !== region) {
+            if (cur.querySelector(textNodeSel)) {
+              if (!seenRows.has(cur)) {
+                seenRows.add(cur);
+                rows.push(cur);
               }
-              return cur;
+              break;
             }
             cur = cur.parentElement;
           }
         }
-        // 2) Specific Meet selectors.
-        for (const sel of containerSel.split(",").map((s: string) => s.trim())) {
-          const el = document.querySelector(sel);
-          if (el && !isA11yAnnouncer(el)) return el;
-        }
-        return null;
+        return rows;
       }
 
       function extract(row: Element): { speaker: string; text: string } | null {
         const badge = row.querySelector(speakerBadgeSel);
         const textEl = row.querySelector(textNodeSel);
-
         const badgeName = (badge?.textContent ?? "").trim();
-        // Text fallback chain: documented selectors → any <span> → raw row.
-        const text = (
-          (textEl?.textContent ?? "").trim()
-          || (row.querySelector("span")?.textContent ?? "").trim()
-          || (row.textContent ?? "").replace(badgeName, "").trim()
-        );
+        const text = (textEl?.textContent ?? "").trim();
         if (!text) return null;
-
         if (badgeName) lastNamedSpeaker = badgeName;
         const speaker = badgeName || lastNamedSpeaker || "Unknown";
         return { speaker, text };
@@ -122,16 +105,12 @@ export async function attachCaptionObserver(
         const extracted = extract(row);
         if (!extracted) return;
 
-        const prev = seen.get(row);
+        const prev = seenByRow.get(row);
         const now = Date.now();
-        if (prev && prev.lastText === extracted.text) return;
+        if (prev && prev.text === extracted.text) return;
 
-        const tStart = prev ? prev.lastAt : now;
-        seen.set(row, {
-          speaker: extracted.speaker,
-          lastText: extracted.text,
-          lastAt: now,
-        });
+        const firstAt = prev ? prev.firstAt : now;
+        seenByRow.set(row, { text: extracted.text, firstAt });
 
         const w = window as unknown as {
           __renatePushCaption?: (c: unknown) => Promise<void>;
@@ -140,64 +119,71 @@ export async function attachCaptionObserver(
 
         if (!sentFirstHtml && w.__renateDumpFirstCaptionDom) {
           sentFirstHtml = true;
-          try { void w.__renateDumpFirstCaptionDom(row.outerHTML.slice(0, 4000)); } catch {}
+          try { void w.__renateDumpFirstCaptionDom(row.outerHTML.slice(0, 8000)); } catch {}
         }
 
         if (w.__renatePushCaption) {
           void w.__renatePushCaption({
             speaker: extracted.speaker,
             text: extracted.text,
-            tStart,
+            tStart: firstAt,
             tEnd: now,
           });
         }
       }
 
-      function attach(container: Element) {
-        for (const child of Array.from(container.children)) emit(child);
+      let attachedRegion: Element | null = null;
+      let attachedObserver: MutationObserver | null = null;
 
-        const obs = new MutationObserver((muts) => {
-          for (const m of muts) {
-            if (m.target instanceof Element) {
-              const row =
-                m.target.closest('[role="listitem"]') ??
-                (m.target.parentElement?.closest('[role="listitem"]') as Element | null) ??
-                m.target;
-              if (row instanceof Element) emit(row);
-            }
-            for (const node of Array.from(m.addedNodes)) {
-              if (node instanceof Element) emit(node);
-            }
-          }
+      function emitAll(region: Element) {
+        for (const row of findRows(region)) emit(row);
+      }
+
+      function attach(region: Element) {
+        // Seed with whatever rows exist right now.
+        emitAll(region);
+
+        const obs = new MutationObserver(() => {
+          // On any mutation inside the region, re-scan all rows. This is
+          // cheap (a handful of rows) and avoids the pitfalls of trying to
+          // figure out which specific row changed.
+          emitAll(region);
         });
-        obs.observe(container, {
+        obs.observe(region, {
           subtree: true,
           childList: true,
           characterData: true,
         });
+        attachedRegion = region;
+        attachedObserver = obs;
         (window as unknown as { __renateCaptionObserver?: MutationObserver })
           .__renateCaptionObserver = obs;
       }
 
-      const existing = findContainer();
-      if (existing) {
-        attach(existing);
-        return;
+      function reattachIfStale() {
+        const fresh = findRegion();
+        const stale =
+          !attachedRegion ||
+          !attachedRegion.isConnected ||
+          (fresh && fresh !== attachedRegion);
+        if (stale) {
+          if (attachedObserver) attachedObserver.disconnect();
+          attachedRegion = null;
+          attachedObserver = null;
+          if (fresh) attach(fresh);
+        }
       }
 
-      // Container hasn't rendered yet; poll and attach as soon as it shows.
-      const poll = setInterval(() => {
-        const c = findContainer();
-        if (c) {
-          clearInterval(poll);
-          attach(c);
-        }
-      }, 500);
+      const existing = findRegion();
+      if (existing) attach(existing);
+
+      // Continuous watchdog — re-attaches on container swap or removal.
+      const poll = setInterval(reattachIfStale, 1000);
       (window as unknown as { __renateCaptionPoll?: ReturnType<typeof setInterval> })
         .__renateCaptionPoll = poll;
     },
     {
-      containerSel: selectors.captionsContainer,
+      regionSel: selectors.captionsContainer,
       speakerBadgeSel: selectors.captionSpeakerBadge,
       textNodeSel: selectors.captionTextNode,
     }
@@ -224,18 +210,55 @@ export async function attachCaptionObserver(
 }
 
 async function enableCaptions(page: Page): Promise<void> {
-  // Enable captions deterministically: find the toggle button by aria-label,
-  // click it if it says "Turn on captions", then VERIFY the caption container
-  // actually renders. Retry up to 3× with 3s backoff. No keyboard fallback —
-  // the global 'c' shortcut silently no-ops when the meeting view doesn't
-  // have keyboard focus (which is almost always in a just-joined Playwright
-  // page) and masks failures.
-  const MAX_ATTEMPTS = 3;
-  const BACKOFF_MS = 3_000;
+  // The join.ts "post-join UI" check uses the Leave-call button, which is
+  // *also* rendered in Meet's lobby ("Please wait until a meeting host brings
+  // you into the call"). So by the time we get here, we may still be in the
+  // lobby for up to a minute or two. The captions toggle button does NOT
+  // exist in the lobby DOM, so we must poll long enough to outlast host
+  // admission delays, and we must first confirm we're actually in-call.
+  const DEADLINE_MS = 120_000;
+  const INTERVAL_MS = 2_000;
   const VERIFY_TIMEOUT_MS = 10_000;
+  const deadline = Date.now() + DEADLINE_MS;
 
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    if (attempt > 1) await page.waitForTimeout(BACKOFF_MS);
+  let attempt = 0;
+  let sawInCallSignal = false;
+  while (Date.now() < deadline) {
+    attempt++;
+    if (attempt > 1) await page.waitForTimeout(INTERVAL_MS);
+
+    await page.mouse.move(640, 400).catch(() => {});
+    await page.mouse.move(640, 760).catch(() => {});
+    await page.mouse.move(640, 400).catch(() => {});
+    await page.waitForTimeout(400);
+
+    // Gate: only attempt CC toggle once we see a true in-call toolbar signal.
+    // The people/participants button is only rendered post-admission; its
+    // presence is a reliable "we're past the lobby" marker. The CC button
+    // itself would also work (it's lobby-absent too), so we accept either.
+    if (!sawInCallSignal) {
+      const inCall = await page
+        .evaluate(
+          ({ peopleSel, ccSel }) => {
+            const q = (sel: string) =>
+              sel.split(",").some((s) => !!document.querySelector(s.trim()));
+            return q(peopleSel) || q(ccSel);
+          },
+          {
+            peopleSel: selectors.peoplePanelButton,
+            ccSel: selectors.captionsToggleButton,
+          }
+        )
+        .catch(() => false);
+      if (!inCall) {
+        if (attempt === 1 || attempt % 5 === 0) {
+          log.info({ attempt }, "waiting for in-call toolbar (likely in lobby)");
+        }
+        continue;
+      }
+      sawInCallSignal = true;
+      log.info({ attempt }, "in-call toolbar detected; attempting captions toggle");
+    }
 
     const candidates = await page
       .locator(selectors.captionsToggleButton)
@@ -280,13 +303,30 @@ async function enableCaptions(page: Page): Promise<void> {
   }
 
   log.error(
-    { attempts: MAX_ATTEMPTS },
-    "captions enablement FAILED: toggle not found or container never rendered — downstream name attribution will fall back to roster"
+    { attempts: attempt, deadlineMs: DEADLINE_MS, sawInCallSignal },
+    "captions enablement FAILED: toggle not found or container never rendered"
   );
+
+  try {
+    const shotPath = "/chunks/captions-debug.png";
+    await page.screenshot({ path: shotPath, fullPage: false });
+    log.info({ shotPath }, "debug screenshot saved");
+  } catch (err) {
+    log.warn({ err }, "screenshot failed");
+  }
+  try {
+    const labels = await page.evaluate(() => {
+      return Array.from(document.querySelectorAll("button, [role='button']"))
+        .map((el) => (el.getAttribute("aria-label") ?? "").trim())
+        .filter((s) => s.length > 0)
+        .slice(0, 40);
+    });
+    log.info({ labels }, "visible button aria-labels");
+  } catch (err) {
+    log.warn({ err }, "aria-label dump failed");
+  }
 }
 
-// Resolve when either the toggle flips to "Turn off captions" OR the caption
-// container shows up in the DOM. Either proves captions are on.
 async function verifyCaptionsOn(page: Page, timeoutMs: number): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {

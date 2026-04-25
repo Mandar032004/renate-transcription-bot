@@ -1,12 +1,8 @@
-import { Queue, Worker } from "bullmq";
+import { Worker } from "bullmq";
 import { Redis as IORedis } from "ioredis";
 import { Pool } from "pg";
 import pino from "pino";
 import { loadConfig } from "./config.js";
-import { transcribeChunk } from "./sarvam.js";
-import { insertTranscriptSegments } from "./persist.js";
-import { createS3Client, ensureBucket, getAudioChunk } from "./s3.js";
-import { finalizeSession } from "./finalize.js";
 import { spawnBot } from "./spawnBot.js";
 
 const log = pino({ name: "worker", level: process.env.LOG_LEVEL ?? "info" });
@@ -17,16 +13,6 @@ async function main() {
 
   const connection = new IORedis(cfg.REDIS_URL, { maxRetriesPerRequest: null });
   const pg = new Pool({ connectionString: cfg.DATABASE_URL });
-  const s3 = createS3Client({
-    endpoint: cfg.S3_ENDPOINT,
-    region: cfg.S3_REGION,
-    accessKeyId: cfg.S3_ACCESS_KEY,
-    secretAccessKey: cfg.S3_SECRET_KEY,
-    forcePathStyle: cfg.S3_FORCE_PATH_STYLE,
-  });
-  await ensureBucket(s3, cfg.S3_BUCKET_AUDIO);
-
-  const finalizeQueue = new Queue("finalize", { connection });
 
   const workers = [
     new Worker(
@@ -46,70 +32,23 @@ async function main() {
           image: cfg.BOT_IMAGE,
           network: cfg.BOT_NETWORK,
           authHostPath: cfg.AUTH_HOST_PATH,
+          brainHostPath: cfg.BRAIN_HOST_PATH || undefined,
           pg,
           env: {
             REDIS_URL: cfg.REDIS_URL,
-            S3_ENDPOINT: cfg.S3_ENDPOINT,
-            S3_REGION: cfg.S3_REGION,
-            S3_ACCESS_KEY: cfg.S3_ACCESS_KEY,
-            S3_SECRET_KEY: cfg.S3_SECRET_KEY,
-            S3_BUCKET_AUDIO: cfg.S3_BUCKET_AUDIO,
-            S3_FORCE_PATH_STYLE: String(cfg.S3_FORCE_PATH_STYLE),
             LOG_LEVEL: cfg.LOG_LEVEL,
+            // Voice assistant passthrough.
+            VA_ENABLED: cfg.VA_ENABLED,
+            OPENAI_API_KEY: cfg.OPENAI_API_KEY,
+            SARVAM_API_KEY: cfg.SARVAM_API_KEY,
+            WAKE_WORD: cfg.WAKE_WORD,
+            TTS_LANGUAGE: cfg.TTS_LANGUAGE,
+            TTS_SPEAKER: cfg.TTS_SPEAKER,
+            TTS_MODEL: cfg.TTS_MODEL,
           },
         });
       },
       { connection, concurrency: 4 }
-    ),
-    new Worker(
-      "transcribe-chunk",
-      async (job) => {
-        const { sessionId, chunkIdx, s3Key } = job.data as {
-          sessionId: string;
-          chunkIdx: number;
-          s3Key: string;
-        };
-        const jobLog = log.child({
-          jobId: job.id,
-          sessionId,
-          chunkIdx,
-          queue: "transcribe-chunk",
-        });
-        jobLog.info("start");
-        const wav = await getAudioChunk(s3, cfg.S3_BUCKET_AUDIO, s3Key);
-        const segments = await transcribeChunk({
-          sessionId,
-          chunkIdx,
-          s3Key,
-          wavBuffer: wav,
-          apiKey: cfg.SARVAM_API_KEY,
-        });
-        await insertTranscriptSegments(pg, sessionId, chunkIdx, segments);
-        jobLog.info({ segments: segments.length }, "done");
-      },
-      { connection, concurrency: 3 }
-    ),
-    new Worker(
-      "finalize",
-      async (job) => {
-        const { sessionId, participantCount } = job.data as {
-          sessionId: string;
-          participantCount?: number | null;
-        };
-        const jobLog = log.child({ jobId: job.id, sessionId, queue: "finalize" });
-        jobLog.info({ participantCount }, "start");
-        await finalizeSession({
-          sessionId,
-          participantCount,
-          pg,
-          redis: connection,
-          s3,
-          bucket: cfg.S3_BUCKET_AUDIO,
-          diarizeUrl: cfg.DIARIZE_URL,
-          openaiApiKey: cfg.OPENAI_API_KEY,
-        });
-      },
-      { connection, concurrency: 1 }
     ),
   ];
 
@@ -124,7 +63,6 @@ async function main() {
   const shutdown = async (sig: string) => {
     log.info({ sig }, "worker: shutdown");
     await Promise.all(workers.map((w) => w.close()));
-    await finalizeQueue.close();
     await connection.quit();
     await pg.end();
     process.exit(0);

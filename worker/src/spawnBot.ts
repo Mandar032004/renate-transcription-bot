@@ -11,6 +11,7 @@ export interface SpawnBotInput {
   image: string;
   network: string;
   authHostPath: string;
+  brainHostPath?: string;
   pg: Pool;
   env: Record<string, string>;
 }
@@ -37,8 +38,18 @@ export async function spawnBot(input: SpawnBotInput): Promise<SpawnBotResult> {
   const name = `renate-bot-${input.sessionId.slice(0, 8)}-${Date.now()}`;
   const hostAuthFile = `${input.authHostPath}/${account.email}.auth.json`;
 
+  const binds = [`${hostAuthFile}:/auth/auth.json:ro`];
+  if (input.brainHostPath) {
+    binds.push(`${input.brainHostPath}:/brain/brain.docx:ro`);
+  }
+
   log.info(
-    { sessionId: input.sessionId, container: name, account: account.email },
+    {
+      sessionId: input.sessionId,
+      container: name,
+      account: account.email,
+      brain: !!input.brainHostPath,
+    },
     "docker create"
   );
 
@@ -54,7 +65,7 @@ export async function spawnBot(input: SpawnBotInput): Promise<SpawnBotResult> {
     HostConfig: {
       AutoRemove: false,
       NetworkMode: input.network,
-      Binds: [`${hostAuthFile}:/auth/auth.json:ro`],
+      Binds: binds,
       ShmSize: 2 * 1024 * 1024 * 1024, // 2GB for Chromium
     },
     Labels: {

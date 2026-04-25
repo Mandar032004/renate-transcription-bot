@@ -26,12 +26,32 @@ export async function joinMeet(opts: JoinOptions): Promise<JoinResult> {
 
   // Headful inside Xvfb — headless-shell doesn't route audio to PulseAudio,
   // so we'd capture silence. See bot/docker/entrypoint.sh.
+  log.info(
+    { pulseServer: process.env.PULSE_SERVER, display: process.env.DISPLAY },
+    "launching chromium"
+  );
   const browser = await chromium.launch({
     headless: false,
+    // Explicitly forward the audio env vars to Chromium so the sandboxed
+    // audio service can find the PulseAudio socket. Playwright inherits
+    // process.env by default, but being explicit guards against sandbox
+    // scrubbing.
+    env: filterEnv({
+      ...process.env,
+      PULSE_SERVER: process.env.PULSE_SERVER ?? "",
+      DISPLAY: process.env.DISPLAY ?? ":99",
+    }),
     args: [
       "--disable-blink-features=AutomationControlled",
       "--use-fake-ui-for-media-stream",
-      "--use-fake-device-for-media-stream",
+      // We DO NOT set --use-fake-device-for-media-stream. Chromium must
+      // enumerate real PulseAudio devices so Meet picks up mic_sink.monitor
+      // (fed by paplay during TTS) as the microphone input. The "no camera"
+      // path is handled gracefully by Meet — it joins with video off.
+      //
+      // --use-file-for-fake-audio-capture is ALSO removed: Chromium reads
+      // that file once into memory via WavAudioHandler, so mid-stream swaps
+      // are ignored.
       "--no-sandbox",
       "--disable-dev-shm-usage",
       "--autoplay-policy=no-user-gesture-required",
@@ -80,11 +100,18 @@ export async function joinMeet(opts: JoinOptions): Promise<JoinResult> {
       }
     }
 
-    // Click join. "Join now" (invited) beats "Ask to join" (knock) when both
-    // are present, but in practice only one is rendered.
-    const joinNow = page.locator(selectors.joinNowButton).first();
-    const askToJoin = page.locator(selectors.askToJoinButton).first();
-    const joinButton = (await joinNow.isVisible().catch(() => false)) ? joinNow : askToJoin;
+    // Meet shows a "Getting ready..." splash with a spinner overlay while
+    // pre-join UI initializes. The Join-now button is in the DOM but
+    // hidden behind the overlay — we must poll for a visible join button,
+    // not just check once.
+    const joinButton = await waitForVisible(
+      page,
+      [selectors.joinNowButton, selectors.askToJoinButton],
+      joinTimeout
+    );
+    if (!joinButton) {
+      throw new Error("no visible join button (Meet never finished loading pre-join UI)");
+    }
 
     log.info("clicking join");
     await joinButton.click({ timeout: joinTimeout });
@@ -107,6 +134,20 @@ export async function joinMeet(opts: JoinOptions): Promise<JoinResult> {
     return { browser, context, page, joinedAt };
   } catch (err) {
     log.error({ err }, "join failed");
+    try {
+      const shot = "/chunks/join-failure.png";
+      await page.screenshot({ path: shot, fullPage: false });
+      const labels = await page.evaluate(() => {
+        return Array.from(document.querySelectorAll("button, [role='button']"))
+          .map((el) => (el.getAttribute("aria-label") ?? el.textContent ?? "").trim())
+          .filter((s) => s.length > 0)
+          .slice(0, 40);
+      });
+      const url = page.url();
+      log.info({ shot, labels, url }, "join-failure diagnostic dumped");
+    } catch (dumpErr) {
+      log.warn({ dumpErr }, "diagnostic dump failed");
+    }
     await context.close().catch(() => {});
     await browser.close().catch(() => {});
     throw err;
@@ -162,6 +203,44 @@ async function ensureMutedInCall(page: Page): Promise<void> {
   await toggleIfOn(page, selectors.preJoinCamToggle, "cam (in-call)");
 }
 
+/** Strip undefined values for Playwright's env type. */
+function filterEnv(env: NodeJS.ProcessEnv): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(env)) {
+    if (typeof v === "string") out[k] = v;
+  }
+  return out;
+}
+
+/**
+ * Poll until one of the given selectors has an actually-visible match.
+ * Meet's pre-join "Getting ready..." spinner keeps buttons in the DOM but
+ * hidden under an overlay, so we must poll — a single visibility check
+ * right after `goto` is too early. Also filters out hidden duplicates
+ * that sometimes live inside collapsed menus.
+ */
+async function waitForVisible(
+  page: Page,
+  selectorList: string[],
+  timeoutMs: number
+): Promise<ReturnType<Page["locator"]> | null> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    for (const sel of selectorList) {
+      const loc = page.locator(sel);
+      const count = await loc.count().catch(() => 0);
+      for (let i = 0; i < count; i++) {
+        const nth = loc.nth(i);
+        if (await nth.isVisible().catch(() => false)) {
+          return nth;
+        }
+      }
+    }
+    await page.waitForTimeout(500);
+  }
+  return null;
+}
+
 async function toggleIfOn(page: Page, selector: string, label: string): Promise<void> {
   const btn = page.locator(selector).first();
   if (!(await btn.isVisible().catch(() => false))) return;
@@ -173,4 +252,38 @@ async function toggleIfOn(page: Page, selector: string, label: string): Promise<
     log.info({ device: label }, "muting");
     await btn.click().catch(() => {});
   }
+}
+
+/**
+ * Flip the in-call mic state. Used by the voice assistant to unmute before
+ * speaking TTS and re-mute after. Returns true when the aria-label actually
+ * flipped to the requested state. Callers should abort speaking if this
+ * returns false (e.g., host-muted participant can't unmute).
+ */
+export async function setMicMuted(page: Page, muted: boolean): Promise<boolean> {
+  const btn = page.locator(selectors.preJoinMicToggle).first();
+  if (!(await btn.isVisible().catch(() => false))) return false;
+
+  const aria = (await btn.getAttribute("aria-label").catch(() => null)) ?? "";
+  const currentlyOn = /turn off/i.test(aria);
+  const wantOn = !muted;
+
+  if (currentlyOn === wantOn) return true;
+
+  await btn.click().catch(() => {});
+
+  // Verify aria-label flipped. Poll briefly — Meet's state reconciliation
+  // can lag ~100ms after the click.
+  const deadline = Date.now() + 1500;
+  while (Date.now() < deadline) {
+    const a = (await btn.getAttribute("aria-label").catch(() => null)) ?? "";
+    const nowOn = /turn off/i.test(a);
+    if (nowOn === wantOn) {
+      log.info({ muted }, "mic state changed");
+      return true;
+    }
+    await page.waitForTimeout(100);
+  }
+  log.warn({ muted, aria }, "mic state did not flip after click");
+  return false;
 }

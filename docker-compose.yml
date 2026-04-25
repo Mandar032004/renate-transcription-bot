@@ -35,25 +35,6 @@ services:
       retries: 10
     networks: [renate]
 
-  minio:
-    image: minio/minio:latest
-    restart: unless-stopped
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-minioadmin}
-    volumes:
-      - minio-data:/data
-    ports:
-      - "${MINIO_API_PORT:-9000}:9000"
-      - "${MINIO_CONSOLE_PORT:-9001}:9001"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-    networks: [renate]
-
   api:
     build:
       context: .
@@ -79,6 +60,9 @@ services:
       # Host-side path to ./auth so the worker can bind-mount the right
       # auth.json into each bot container it spawns.
       AUTH_HOST_PATH: ${PWD}/auth
+      # Host-side path to the brain knowledge file; bind-mounted into each
+      # bot container at /brain/brain.docx when VA_ENABLED=true.
+      BRAIN_HOST_PATH: ${PWD}/brain.docx
     # Docker socket is mounted so the worker can `docker run` per-session
     # bot containers.
     volumes:
@@ -86,21 +70,6 @@ services:
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
-      minio: { condition: service_healthy }
-    networks: [renate]
-
-  diarize:
-    build:
-      context: ./diarize
-      dockerfile: Dockerfile
-    restart: unless-stopped
-    env_file: .env
-    environment:
-      DIARIZE_PORT: ${DIARIZE_PORT:-8000}
-    ports:
-      - "${DIARIZE_PORT:-8000}:8000"
-    volumes:
-      - diarize-cache:/root/.cache
     networks: [renate]
 
   # Ephemeral — not started by `up`. Built so the worker can spawn it per
@@ -121,12 +90,11 @@ services:
     env_file: .env
     volumes:
       - ./auth:/auth:ro
+      - ./brain.docx:/brain/brain.docx:ro
     networks: [renate]
 
 volumes:
   pg-data:
-  minio-data:
-  diarize-cache:
 
 networks:
   renate:

@@ -5,24 +5,35 @@ const schema = z.object({
   MEET_URL: z.string().url().optional(),
   AUTH_PROFILE: z.string().default("/auth/auth.json"),
   REDIS_URL: z.string().default("redis://redis:6379"),
-  S3_ENDPOINT: z.string().default("http://minio:9000"),
-  S3_REGION: z.string().default("us-east-1"),
-  S3_ACCESS_KEY: z.string().default("minioadmin"),
-  S3_SECRET_KEY: z.string().default("minioadmin"),
-  S3_BUCKET_AUDIO: z.string().default("renate-audio"),
-  S3_FORCE_PATH_STYLE: z
-    .string()
-    .default("true")
-    .transform((v) => v === "true"),
-  AUDIO_CHUNK_SECONDS: z.coerce.number().default(28),
-  AUDIO_SAMPLE_RATE: z.coerce.number().default(16_000),
-  AUDIO_CHUNK_DIR: z.string().default("/chunks"),
-  PULSE_SOURCE: z.string().default("meet_sink.monitor"),
   HEARTBEAT_INTERVAL_MS: z.coerce.number().default(10_000),
   HEARTBEAT_TTL_SECONDS: z.coerce.number().default(30),
   CALL_HARD_TIMEOUT_MS: z.coerce.number().default(120 * 60 * 1000),
   DISPLAY_NAME: z.string().default("Renate"),
   LOG_LEVEL: z.string().default("info"),
+
+  // --- Voice assistant (VA) ---
+  VA_ENABLED: z
+    .string()
+    .default("false")
+    .transform((v) => v === "true"),
+  OPENAI_API_KEY: z.string().default(""),
+  OPENAI_ANSWER_MODEL: z.string().default("gpt-4.1-mini"),
+  SARVAM_API_KEY: z.string().default(""),
+  BRAIN_PATH: z.string().default("/brain/brain.docx"),
+  WAKE_WORD: z.string().default("renate"),
+  VA_SETTLE_MS: z.coerce.number().default(500),
+  VA_MAX_QUESTION_MS: z.coerce.number().default(5000),
+  VA_COOLDOWN_MS: z.coerce.number().default(2000),
+  VA_STREAMING: z
+    .string()
+    .default("true")
+    .transform((v) => v === "true"),
+  VA_ANSWER_MAX_TOKENS: z.coerce.number().default(300),
+  MIC_SINK: z.string().default("mic_sink"),
+  FAKE_MIC_PATH: z.string().default("/tmp/fake-mic.wav"),
+  TTS_LANGUAGE: z.string().default("en-IN"),
+  TTS_SPEAKER: z.string().default("shubh"),
+  TTS_MODEL: z.string().default("bulbul:v3"),
 });
 
 export type BotConfig = z.infer<typeof schema>;

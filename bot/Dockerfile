@@ -23,7 +23,11 @@ COPY bot/package.json ./bot/
 RUN npm install --workspace @renate/bot --include-workspace-root
 
 COPY bot ./bot
-RUN npm run build --workspace @renate/bot \
+# Normalize Windows CRLF line endings so /usr/bin/env bash in entrypoint.sh
+# doesn't fail with `'bash\r': No such file or directory` when the repo was
+# checked out on Windows with core.autocrlf=true.
+RUN sed -i 's/\r$//' ./bot/docker/entrypoint.sh \
+    && npm run build --workspace @renate/bot \
     && chmod +x ./bot/docker/entrypoint.sh \
     && mkdir -p /chunks
 
