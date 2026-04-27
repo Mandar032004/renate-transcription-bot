@@ -1,14 +1,15 @@
 import type { Page } from "playwright";
 import pino from "pino";
 import type { DomCaption } from "../captions.js";
-import { loadBrain } from "./brain.js";
-import { matchWakeWord } from "./wakeWord.js";
-import { QuestionAccumulator, type AccumulatorSettleMeta } from "./questionAccumulator.js";
-import { canAccept, suppressesCaptions, type VaState } from "./stateMachine.js";
-import { answer, answerStream } from "./answerer.js";
-import { synthesize } from "./tts.js";
-import { speak, playWavBuffer } from "./speak.js";
 import { setMicMuted } from "../join.js";
+import { answer, answerStream } from "./answerer.js";
+import { loadBrain } from "./brain.js";
+import { MeetingMemory } from "./meetingMemory.js";
+import { QuestionAccumulator, type AccumulatorSettleMeta } from "./questionAccumulator.js";
+import { speak, playWavBuffer } from "./speak.js";
+import { canAccept, suppressesCaptions, type VaState } from "./stateMachine.js";
+import { synthesize } from "./tts.js";
+import { matchWakeWord } from "./wakeWord.js";
 
 const log = pino({ name: "bot.va", level: process.env.LOG_LEVEL ?? "info" });
 
@@ -36,10 +37,29 @@ export interface VoiceAssistant {
   stop(): Promise<void>;
 }
 
+type Timings = {
+  settleMs: number;
+  llmStartMs?: number;
+  firstTokenMs?: number;
+  firstChunkMs?: number;
+  llmEndMs?: number;
+  ttsStartMs?: number;
+  ttsEndMs?: number;
+  unmuteStartMs?: number;
+  unmuteEndMs?: number;
+  audioStartMs?: number;
+  audioEndMs?: number;
+  streaming: boolean;
+  sentencesCount: number;
+  unmuted: boolean;
+};
+type MsFn = (t?: number) => number;
+
 export async function createVoiceAssistant(
   opts: VoiceAssistantOptions
 ): Promise<VoiceAssistant> {
   const brain = await loadBrain(opts.brainPath);
+  const memory = new MeetingMemory({ displayName: opts.displayName });
 
   let state: VaState = "IDLE";
   let accumulator: QuestionAccumulator | null = null;
@@ -50,39 +70,23 @@ export async function createVoiceAssistant(
     state = next;
   };
 
-  const runAnswer = async (question: string, meta: AccumulatorSettleMeta) => {
+  const runAnswer = async (
+    question: string,
+    meta: AccumulatorSettleMeta,
+    speaker: string
+  ) => {
     accumulator = null;
     const cleaned = question.trim();
-    // Reject empty or bare-wake-only utterances ("Renate.", "Renate"). Now
-    // that we no longer strip the wake word in the accumulator, a user who
-    // just said "Renate" with nothing else would otherwise reach the LLM
-    // with no actual question.
-    if (!cleaned || /^renate[\s,!?\.]*$/i.test(cleaned)) {
+    const bareWakePattern = new RegExp(`^${escapeRegex(opts.wakeWord)}[\\s,!?\\.]*$`, "i");
+    if (!cleaned || bareWakePattern.test(cleaned)) {
       log.warn("empty question after accumulation; returning to idle");
       setState("IDLE");
       return;
     }
 
-    // All timings relative to `stopAt` = last caption update = user-perceived
-    // "finished speaking". audioStartMs is the metric we optimize for.
     const t0 = meta.stopAt;
     const ms = (t?: number) => (t ?? Date.now()) - t0;
-    const timings: {
-      settleMs: number;
-      llmStartMs?: number;
-      firstTokenMs?: number;
-      firstChunkMs?: number;
-      llmEndMs?: number;
-      ttsStartMs?: number;
-      ttsEndMs?: number;
-      unmuteStartMs?: number;
-      unmuteEndMs?: number;
-      audioStartMs?: number;
-      audioEndMs?: number;
-      streaming: boolean;
-      sentencesCount: number;
-      unmuted: boolean;
-    } = {
+    const timings: Timings = {
       settleMs: ms(),
       streaming: opts.streaming,
       sentencesCount: 0,
@@ -90,16 +94,16 @@ export async function createVoiceAssistant(
     };
 
     setState("THINKING");
+    let reply = "";
     try {
-      if (opts.streaming) {
-        await runStreaming(question, timings, ms);
-      } else {
-        await runNonStreaming(question, timings, ms);
-      }
+      reply = opts.streaming
+        ? await runStreaming(question, timings, ms)
+        : await runNonStreaming(question, timings, ms);
     } catch (err) {
       log.error({ err, timings }, "va run failed");
     }
 
+    if (reply) memory.markInteraction(speaker, reply);
     log.info({ timings }, "va timings");
 
     setState("COOLDOWN");
@@ -107,31 +111,18 @@ export async function createVoiceAssistant(
     if (!stopped) setState("IDLE");
   };
 
-  type Timings = {
-    settleMs: number;
-    llmStartMs?: number;
-    firstTokenMs?: number;
-    firstChunkMs?: number;
-    llmEndMs?: number;
-    ttsStartMs?: number;
-    ttsEndMs?: number;
-    unmuteStartMs?: number;
-    unmuteEndMs?: number;
-    audioStartMs?: number;
-    audioEndMs?: number;
-    streaming: boolean;
-    sentencesCount: number;
-    unmuted: boolean;
-  };
-  type MsFn = (t?: number) => number;
-
-  const runNonStreaming = async (question: string, timings: Timings, ms: MsFn): Promise<void> => {
+  const runNonStreaming = async (
+    question: string,
+    timings: Timings,
+    ms: MsFn
+  ): Promise<string> => {
     timings.llmStartMs = ms();
     let reply: string;
     try {
       reply = await answer({
         question,
         brain,
+        meetingContext: memory.contextFor(question),
         openaiKey: opts.openaiKey,
         model: opts.answerModel,
         maxTokens: opts.answerMaxTokens,
@@ -139,16 +130,13 @@ export async function createVoiceAssistant(
       timings.llmEndMs = ms();
     } catch (err) {
       log.error({ err, timings }, "answer failed");
-      return;
+      return "";
     }
 
     log.info({ reply, llmMs: (timings.llmEndMs ?? 0) - (timings.llmStartMs ?? 0) }, "va reply");
-    if (stopped) return;
+    if (stopped) return reply;
 
     setState("SPEAKING");
-    // Run TTS synthesis and mic unmute concurrently — unmute has to poll for
-    // the aria-label flip (up to ~1.5s) and we don't need the audio bytes
-    // to start that.
     timings.ttsStartMs = ms();
     timings.unmuteStartMs = ms();
     const [wav, unmuted] = await Promise.all([
@@ -170,7 +158,7 @@ export async function createVoiceAssistant(
     timings.unmuted = unmuted;
     if (!unmuted) {
       log.warn({ timings }, "could not unmute mic; skipping speak");
-      return;
+      return reply;
     }
     timings.sentencesCount = 1;
     try {
@@ -189,16 +177,14 @@ export async function createVoiceAssistant(
     } catch (err) {
       log.error({ err, timings }, "speak failed");
     }
+    return reply;
   };
 
-  const runStreaming = async (question: string, timings: Timings, ms: MsFn): Promise<void> => {
-    // Streaming pipeline:
-    //   OpenAI stream → sentence chunks → per-sentence TTS (parallel) →
-    //   sequential paplay (chained by arrival order). Unmute runs in
-    //   parallel with the first sentence's TTS.
-    //
-    // audioStartMs drops from `settle + fullLLM + fullTTS` to
-    // `settle + firstTokenLatency + firstSentenceTail + firstSentenceTTS`.
+  const runStreaming = async (
+    question: string,
+    timings: Timings,
+    ms: MsFn
+  ): Promise<string> => {
     timings.llmStartMs = ms();
     timings.unmuteStartMs = ms();
     const unmutePromise = setMicMuted(opts.page, false).then((u) => {
@@ -216,6 +202,7 @@ export async function createVoiceAssistant(
     const stream = answerStream({
       question,
       brain,
+      meetingContext: memory.contextFor(question),
       openaiKey: opts.openaiKey,
       model: opts.answerModel,
       maxTokens: opts.answerMaxTokens,
@@ -228,12 +215,7 @@ export async function createVoiceAssistant(
           ctrl.abort();
           break;
         }
-        if (timings.firstTokenMs === undefined) {
-          // answerStream's internal first-token log fires at first delta.
-          // We get the first *chunk* only after a sentence boundary, so
-          // firstChunkMs is the more accurate metric here.
-          timings.firstTokenMs = ms();
-        }
+        if (timings.firstTokenMs === undefined) timings.firstTokenMs = ms();
         if (timings.firstChunkMs === undefined) {
           timings.firstChunkMs = ms();
           timings.ttsStartMs = ms();
@@ -249,9 +231,6 @@ export async function createVoiceAssistant(
           model: opts.ttsModel,
         });
 
-        // Chain this sentence's playback after the prior sentence's
-        // playback. The chain awaits both this sentence's TTS and (for
-        // the first sentence) the unmute before calling paplay.
         const priorPlay = playChain;
         playChain = (async () => {
           let wav: Buffer;
@@ -295,18 +274,10 @@ export async function createVoiceAssistant(
       }
       timings.llmEndMs = ms();
     } catch (err) {
-      // Stream errored after yielding some chunks — let what we have drain
-      // to paplay instead of swallowing already-good sentences. Don't
-      // toggle `aborted`; that's reserved for TTS failures and shutdown.
       log.error({ err, timings }, "llm stream failed");
     }
 
-    // Wait for the last queued sentence to finish playing.
     await playChain.catch(() => {});
-
-    // Make sure we re-mute even if we never entered the play path (e.g.
-    // unmute failed or LLM returned nothing). setMicMuted(true) is
-    // idempotent and cheap.
     try {
       await setMicMuted(opts.page, true);
     } catch (err) {
@@ -326,6 +297,7 @@ export async function createVoiceAssistant(
       },
       "va reply (streaming)"
     );
+    return reply;
   };
 
   return {
@@ -337,16 +309,11 @@ export async function createVoiceAssistant(
         "va caption received"
       );
 
-      // Suppress everything while speaking or cooling down — guards against
-      // our own voice triggering another wake.
-      if (suppressesCaptions(state)) return;
+      const isHuman = !!c.speaker && c.speaker !== opts.displayName && c.speaker !== "You";
+      if (isHuman) memory.observe(c);
 
-      // Never trigger on captions attributed to ourselves or to no one.
-      // Meet labels the local participant as "You" regardless of displayName,
-      // and rows whose badge never resolved arrive with speaker === "" — both
-      // must be rejected, otherwise late self-captions slip through after the
-      // bot finishes speaking and re-fire the wake word.
-      if (!c.speaker || c.speaker === opts.displayName || c.speaker === "You") return;
+      if (suppressesCaptions(state)) return;
+      if (!isHuman) return;
 
       if (state === "ACCUMULATING") {
         accumulator?.feed(c);
@@ -356,16 +323,20 @@ export async function createVoiceAssistant(
       if (!canAccept(state)) return;
 
       const match = matchWakeWord(c.text, opts.wakeWord);
-      if (!match.matched) return;
+      const isFollowUp = !match.matched && memory.canTreatAsFollowUp(c);
+      if (!match.matched && !isFollowUp) return;
 
-      log.info({ speaker: c.speaker, tail: match.tail }, "wake word fired");
+      log.info(
+        { speaker: c.speaker, tail: match.tail, followUp: isFollowUp },
+        match.matched ? "wake word fired" : "follow-up question accepted"
+      );
       setState("ACCUMULATING");
       accumulator = new QuestionAccumulator({
         settleMs: opts.settleMs,
         maxQuestionMs: opts.maxQuestionMs,
         onSettle: (q, meta) => {
           log.info({ question: q, settleReason: meta.reason }, "va question (post-settle)");
-          void runAnswer(q, meta);
+          void runAnswer(q, meta, c.speaker);
         },
       });
       accumulator.start(c);
@@ -374,7 +345,6 @@ export async function createVoiceAssistant(
       stopped = true;
       accumulator?.cancel();
       accumulator = null;
-      // Best-effort: ensure mic is muted on shutdown regardless of state.
       try {
         await setMicMuted(opts.page, true);
       } catch (err) {
@@ -382,4 +352,8 @@ export async function createVoiceAssistant(
       }
     },
   };
+}
+
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
