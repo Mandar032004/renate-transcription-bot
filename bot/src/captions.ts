@@ -51,8 +51,10 @@ export async function attachCaptionObserver(
       // each other on every mutation, and collapsed their tStart timestamps
       // onto one — which in turn caused Q1's row to clobber Q2's text in
       // the accumulator.
-      const seenByRow = new WeakMap<Element, { text: string; firstAt: number }>();
-      let lastNamedSpeaker = "";
+      const seenByRow = new WeakMap<
+        Element,
+        { text: string; firstAt: number; speaker: string }
+      >();
       let sentFirstHtml = false;
 
       function findRegion(): Element | null {
@@ -96,9 +98,7 @@ export async function attachCaptionObserver(
         const badgeName = (badge?.textContent ?? "").trim();
         const text = (textEl?.textContent ?? "").trim();
         if (!text) return null;
-        if (badgeName) lastNamedSpeaker = badgeName;
-        const speaker = badgeName || lastNamedSpeaker || "Unknown";
-        return { speaker, text };
+        return { speaker: badgeName, text };
       }
 
       function emit(row: Element) {
@@ -109,8 +109,14 @@ export async function attachCaptionObserver(
         const now = Date.now();
         if (prev && prev.text === extracted.text) return;
 
+        // Per-row speaker carryover: lock in the badge name the first time we
+        // see this row, and reuse it on subsequent updates of the *same* row.
+        // Never inherit speaker from a different row — that leak let bot-self
+        // captions wear the user's name and re-fire the wake word.
+        const speaker = extracted.speaker || prev?.speaker || "";
+
         const firstAt = prev ? prev.firstAt : now;
-        seenByRow.set(row, { text: extracted.text, firstAt });
+        seenByRow.set(row, { text: extracted.text, firstAt, speaker });
 
         const w = window as unknown as {
           __renatePushCaption?: (c: unknown) => Promise<void>;
@@ -124,7 +130,7 @@ export async function attachCaptionObserver(
 
         if (w.__renatePushCaption) {
           void w.__renatePushCaption({
-            speaker: extracted.speaker,
+            speaker,
             text: extracted.text,
             tStart: firstAt,
             tEnd: now,

@@ -336,8 +336,12 @@ export async function createVoiceAssistant(
       // our own voice triggering another wake.
       if (suppressesCaptions(state)) return;
 
-      // Never trigger on captions attributed to ourselves.
-      if (c.speaker && c.speaker === opts.displayName) return;
+      // Never trigger on captions attributed to ourselves or to no one.
+      // Meet labels the local participant as "You" regardless of displayName,
+      // and rows whose badge never resolved arrive with speaker === "" — both
+      // must be rejected, otherwise late self-captions slip through after the
+      // bot finishes speaking and re-fire the wake word.
+      if (!c.speaker || c.speaker === opts.displayName || c.speaker === "You") return;
 
       if (state === "ACCUMULATING") {
         accumulator?.feed(c);

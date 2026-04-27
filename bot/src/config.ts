@@ -23,7 +23,7 @@ const schema = z.object({
   WAKE_WORD: z.string().default("renate"),
   VA_SETTLE_MS: z.coerce.number().default(500),
   VA_MAX_QUESTION_MS: z.coerce.number().default(5000),
-  VA_COOLDOWN_MS: z.coerce.number().default(2000),
+  VA_COOLDOWN_MS: z.coerce.number().default(4000),
   VA_STREAMING: z
     .string()
     .default("true")
