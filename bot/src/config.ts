@@ -21,7 +21,7 @@ const schema = z.object({
   SARVAM_API_KEY: z.string().default(""),
   BRAIN_PATH: z.string().default("/brain/brain.docx"),
   WAKE_WORD: z.string().default("renate"),
-  VA_SETTLE_MS: z.coerce.number().default(500),
+  VA_SETTLE_MS: z.coerce.number().default(1500),
   VA_MAX_QUESTION_MS: z.coerce.number().default(5000),
   VA_COOLDOWN_MS: z.coerce.number().default(4000),
   VA_STREAMING: z

@@ -52,7 +52,12 @@ export async function createVoiceAssistant(
 
   const runAnswer = async (question: string, meta: AccumulatorSettleMeta) => {
     accumulator = null;
-    if (!question.trim()) {
+    const cleaned = question.trim();
+    // Reject empty or bare-wake-only utterances ("Renate.", "Renate"). Now
+    // that we no longer strip the wake word in the accumulator, a user who
+    // just said "Renate" with nothing else would otherwise reach the LLM
+    // with no actual question.
+    if (!cleaned || /^renate[\s,!?\.]*$/i.test(cleaned)) {
       log.warn("empty question after accumulation; returning to idle");
       setState("IDLE");
       return;
@@ -358,7 +363,6 @@ export async function createVoiceAssistant(
       accumulator = new QuestionAccumulator({
         settleMs: opts.settleMs,
         maxQuestionMs: opts.maxQuestionMs,
-        wakeWord: opts.wakeWord,
         onSettle: (q, meta) => {
           log.info({ question: q, settleReason: meta.reason }, "va question (post-settle)");
           void runAnswer(q, meta);

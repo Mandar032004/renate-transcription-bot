@@ -1,5 +1,4 @@
 import type { DomCaption } from "../captions.js";
-import { matchWakeWord } from "./wakeWord.js";
 
 export interface AccumulatorSettleMeta {
   stopAt: number;   // last caption update time — proxy for "user stopped speaking"
@@ -10,7 +9,6 @@ export interface AccumulatorSettleMeta {
 export interface AccumulatorOptions {
   settleMs: number;       // idle time before we consider the question complete
   maxQuestionMs: number;  // hard cap from first wake-word hit
-  wakeWord: string;       // so we can strip it from the final row on settle
   onSettle: (question: string, meta: AccumulatorSettleMeta) => void;
 }
 
@@ -99,19 +97,11 @@ export class QuestionAccumulator {
     this.settleTimer = null;
     this.hardTimer = null;
 
-    // Assemble: first row has the wake word — strip it to get the question
-    // tail. Subsequent rows (if any — same speaker spoke across multiple
-    // Meet caption rows) are appended verbatim.
-    const parts: string[] = [];
-    this.rowOrder.forEach((rowKey, idx) => {
-      const text = this.rows.get(rowKey) ?? "";
-      if (idx === 0) {
-        const m = matchWakeWord(text, this.opts.wakeWord);
-        parts.push(m.matched ? m.tail : text);
-      } else {
-        parts.push(text);
-      }
-    });
+    // Assemble the full utterance verbatim — including the wake word. The
+    // LLM handles a leading "Renate," vocative gracefully and benefits from
+    // the full sentence in referential cases ("How does Renate ...?"), where
+    // earlier wake-word stripping erased the question subject.
+    const parts = this.rowOrder.map((rowKey) => this.rows.get(rowKey) ?? "");
     const question = parts.join(" ").replace(/\s+/g, " ").trim();
     this.opts.onSettle(question, {
       stopAt: this.lastUpdateAt,
