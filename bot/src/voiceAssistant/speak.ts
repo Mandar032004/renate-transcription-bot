@@ -14,6 +14,7 @@ export interface SpeakInput {
   wav: Buffer;
   micSink: string;
   alreadyUnmuted?: boolean;
+  signal?: AbortSignal;
   onAudioStart?: () => void;
   onAudioEnd?: () => void;
 }
@@ -27,12 +28,14 @@ export async function playWavBuffer(
   wav: Buffer,
   sink: string,
   onStart?: () => void,
-  onEnd?: () => void
+  onEnd?: () => void,
+  signal?: AbortSignal
 ): Promise<void> {
+  if (signal?.aborted) throw new Error("playback aborted");
   const tmpFile = join(tmpdir(), `tts-${randomUUID()}.wav`);
   await writeFile(tmpFile, wav);
   try {
-    await playWav(tmpFile, sink, onStart, onEnd);
+    await playWav(tmpFile, sink, onStart, onEnd, signal);
   } finally {
     await unlink(tmpFile).catch(() => {});
   }
@@ -65,7 +68,13 @@ export async function speak(input: SpeakInput): Promise<boolean> {
         return false;
       }
     }
-    await playWav(tmpFile, input.micSink, input.onAudioStart, input.onAudioEnd);
+    await playWav(
+      tmpFile,
+      input.micSink,
+      input.onAudioStart,
+      input.onAudioEnd,
+      input.signal
+    );
     return true;
   } catch (err) {
     log.error({ err }, "speak failed");
@@ -108,20 +117,42 @@ function playWav(
   path: string,
   sink: string,
   onStart?: () => void,
-  onEnd?: () => void
+  onEnd?: () => void,
+  signal?: AbortSignal
 ): Promise<void> {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error("playback aborted"));
+      return;
+    }
+
     const p = spawn("paplay", [`--device=${sink}`, path], {
       stdio: ["ignore", "ignore", "pipe"],
     });
     onStart?.();
     let stderr = "";
+    let aborted = false;
+
+    const abort = () => {
+      aborted = true;
+      p.kill("SIGTERM");
+    };
+    signal?.addEventListener("abort", abort, { once: true });
+
     p.stderr?.on("data", (d) => {
       stderr += String(d);
     });
-    p.on("error", reject);
+    p.on("error", (err) => {
+      signal?.removeEventListener("abort", abort);
+      reject(err);
+    });
     p.on("close", (code) => {
+      signal?.removeEventListener("abort", abort);
       onEnd?.();
+      if (aborted || signal?.aborted) {
+        reject(new Error("playback aborted"));
+        return;
+      }
       if (code === 0) resolve();
       else reject(new Error(`paplay exit ${code}: ${stderr.slice(0, 500)}`));
     });

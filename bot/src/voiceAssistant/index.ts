@@ -64,6 +64,8 @@ export async function createVoiceAssistant(
   let state: VaState = "IDLE";
   let accumulator: QuestionAccumulator | null = null;
   let stopped = false;
+  let activeAbort: AbortController | null = null;
+  let activeInterrupt: "stop" | "question" | null = null;
 
   const setState = (next: VaState) => {
     log.info({ from: state, to: next }, "va state");
@@ -95,16 +97,33 @@ export async function createVoiceAssistant(
 
     setState("THINKING");
     let reply = "";
+    const runAbort = new AbortController();
+    activeAbort = runAbort;
+    activeInterrupt = null;
     try {
       reply = opts.streaming
-        ? await runStreaming(question, timings, ms)
-        : await runNonStreaming(question, timings, ms);
+        ? await runStreaming(question, timings, ms, runAbort.signal)
+        : await runNonStreaming(question, timings, ms, runAbort.signal);
     } catch (err) {
-      log.error({ err, timings }, "va run failed");
+      if (runAbort.signal.aborted) {
+        log.info({ interrupt: activeInterrupt, timings }, "va run aborted");
+      } else {
+        log.error({ err, timings }, "va run failed");
+      }
+    } finally {
+      if (activeAbort === runAbort) activeAbort = null;
     }
 
-    if (reply) memory.markInteraction(speaker, reply);
+    if (reply && !runAbort.signal.aborted) memory.markInteraction(speaker, reply);
     log.info({ timings }, "va timings");
+
+    if (runAbort.signal.aborted) {
+      if (activeInterrupt === "stop") {
+        activeInterrupt = null;
+        if (!stopped && state !== "ACCUMULATING") setState("IDLE");
+      }
+      return;
+    }
 
     setState("COOLDOWN");
     await new Promise((r) => setTimeout(r, opts.cooldownMs));
@@ -114,7 +133,8 @@ export async function createVoiceAssistant(
   const runNonStreaming = async (
     question: string,
     timings: Timings,
-    ms: MsFn
+    ms: MsFn,
+    signal: AbortSignal
   ): Promise<string> => {
     timings.llmStartMs = ms();
     let reply: string;
@@ -146,6 +166,7 @@ export async function createVoiceAssistant(
         languageCode: opts.ttsLanguage,
         speaker: opts.ttsSpeaker,
         model: opts.ttsModel,
+        signal,
       }).then((w) => {
         timings.ttsEndMs = ms();
         return w;
@@ -167,6 +188,7 @@ export async function createVoiceAssistant(
         wav,
         micSink: opts.micSink,
         alreadyUnmuted: true,
+        signal,
         onAudioStart: () => {
           timings.audioStartMs = ms();
         },
@@ -183,7 +205,8 @@ export async function createVoiceAssistant(
   const runStreaming = async (
     question: string,
     timings: Timings,
-    ms: MsFn
+    ms: MsFn,
+    signal: AbortSignal
   ): Promise<string> => {
     timings.llmStartMs = ms();
     timings.unmuteStartMs = ms();
@@ -199,6 +222,8 @@ export async function createVoiceAssistant(
     let aborted = false;
 
     const ctrl = new AbortController();
+    const abortStream = () => ctrl.abort();
+    signal.addEventListener("abort", abortStream, { once: true });
     const stream = answerStream({
       question,
       brain,
@@ -211,7 +236,7 @@ export async function createVoiceAssistant(
 
     try {
       for await (const chunk of stream) {
-        if (stopped || aborted) {
+        if (stopped || aborted || signal.aborted) {
           ctrl.abort();
           break;
         }
@@ -229,6 +254,7 @@ export async function createVoiceAssistant(
           languageCode: opts.ttsLanguage,
           speaker: opts.ttsSpeaker,
           model: opts.ttsModel,
+          signal,
         });
 
         const priorPlay = playChain;
@@ -253,7 +279,7 @@ export async function createVoiceAssistant(
             timings.ttsEndMs = ms();
           }
           await priorPlay;
-          if (stopped || aborted) return;
+          if (stopped || aborted || signal.aborted) return;
           try {
             await playWavBuffer(
               wav,
@@ -263,7 +289,8 @@ export async function createVoiceAssistant(
               },
               () => {
                 timings.audioEndMs = ms();
-              }
+              },
+              signal
             );
             timings.sentencesCount++;
           } catch (err) {
@@ -274,7 +301,13 @@ export async function createVoiceAssistant(
       }
       timings.llmEndMs = ms();
     } catch (err) {
-      log.error({ err, timings }, "llm stream failed");
+      if (signal.aborted) {
+        log.info({ timings }, "llm stream aborted");
+      } else {
+        log.error({ err, timings }, "llm stream failed");
+      }
+    } finally {
+      signal.removeEventListener("abort", abortStream);
     }
 
     await playChain.catch(() => {});
@@ -312,6 +345,29 @@ export async function createVoiceAssistant(
       const isHuman = !!c.speaker && c.speaker !== opts.displayName && c.speaker !== "You";
       if (isHuman) memory.observe(c);
 
+      if (isHuman && (state === "THINKING" || state === "SPEAKING")) {
+        const match = matchWakeWord(c.text, opts.wakeWord);
+        if (isStopCommand(c.text)) {
+          log.info({ speaker: c.speaker, text: c.text }, "stop command received; aborting reply");
+          activeInterrupt = "stop";
+          activeAbort?.abort();
+          accumulator?.cancel();
+          accumulator = null;
+          setState("IDLE");
+          return;
+        }
+        if (match.matched || isLikelyQuestion(c.text)) {
+          log.info(
+            { speaker: c.speaker, text: c.text, wake: match.matched },
+            "human interruption question received"
+          );
+          activeInterrupt = "question";
+          activeAbort?.abort();
+          beginAccumulating(c, match.matched ? "wake word fired" : "interrupt question accepted");
+          return;
+        }
+      }
+
       if (suppressesCaptions(state)) return;
       if (!isHuman) return;
 
@@ -326,23 +382,14 @@ export async function createVoiceAssistant(
       const isFollowUp = !match.matched && memory.canTreatAsFollowUp(c);
       if (!match.matched && !isFollowUp) return;
 
-      log.info(
-        { speaker: c.speaker, tail: match.tail, followUp: isFollowUp },
-        match.matched ? "wake word fired" : "follow-up question accepted"
-      );
-      setState("ACCUMULATING");
-      accumulator = new QuestionAccumulator({
-        settleMs: opts.settleMs,
-        maxQuestionMs: opts.maxQuestionMs,
-        onSettle: (q, meta) => {
-          log.info({ question: q, settleReason: meta.reason }, "va question (post-settle)");
-          void runAnswer(q, meta, c.speaker);
-        },
+      beginAccumulating(c, match.matched ? "wake word fired" : "follow-up question accepted", {
+        tail: match.tail,
+        followUp: isFollowUp,
       });
-      accumulator.start(c);
     },
     async stop() {
       stopped = true;
+      activeAbort?.abort();
       accumulator?.cancel();
       accumulator = null;
       try {
@@ -352,8 +399,42 @@ export async function createVoiceAssistant(
       }
     },
   };
+
+  function beginAccumulating(
+    c: DomCaption,
+    msg: string,
+    extra: Record<string, unknown> = {}
+  ): void {
+    setState("ACCUMULATING");
+    accumulator?.cancel();
+    accumulator = new QuestionAccumulator({
+      settleMs: opts.settleMs,
+      maxQuestionMs: opts.maxQuestionMs,
+      onSettle: (q, meta) => {
+        log.info({ question: q, settleReason: meta.reason }, "va question (post-settle)");
+        void runAnswer(q, meta, c.speaker);
+      },
+    });
+    log.info({ speaker: c.speaker, ...extra }, msg);
+    accumulator.start(c);
+  }
 }
 
 function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function isStopCommand(text: string): boolean {
+  const normalized = text.toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
+  return /^(stop|stop it|renate stop|hey renate stop|okay stop|ok stop|enough|cancel|be quiet|mute)$/.test(
+    normalized
+  );
+}
+
+function isLikelyQuestion(text: string): boolean {
+  const normalized = text.toLowerCase().trim();
+  if (normalized.includes("?")) return true;
+  return /\b(what|why|how|when|where|who|which|can|could|should|would|do|does|did|is|are|will)\b/.test(
+    normalized
+  );
 }

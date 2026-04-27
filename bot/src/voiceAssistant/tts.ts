@@ -12,6 +12,7 @@ export interface SynthesizeInput {
   speaker?: string;       // e.g. "anushka"
   model?: string;         // e.g. "bulbul:v2"
   timeoutMs?: number;
+  signal?: AbortSignal;
 }
 
 /**
@@ -31,6 +32,8 @@ export async function synthesize(input: SynthesizeInput): Promise<Buffer> {
 
   const ctrl = new AbortController();
   const timeout = setTimeout(() => ctrl.abort(), input.timeoutMs ?? 10_000);
+  const abort = () => ctrl.abort();
+  input.signal?.addEventListener("abort", abort, { once: true });
 
   const tStart = Date.now();
   let res: Response;
@@ -45,6 +48,7 @@ export async function synthesize(input: SynthesizeInput): Promise<Buffer> {
       signal: ctrl.signal,
     });
   } finally {
+    input.signal?.removeEventListener("abort", abort);
     clearTimeout(timeout);
   }
 
