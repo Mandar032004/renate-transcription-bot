@@ -91,9 +91,10 @@ export interface SentenceChunk {
   isFinal: boolean;
 }
 
-const FIRST_CHUNK_MIN_CHARS = 15;
-const SOFT_CAP_CHARS = 120;
-const HARD_CAP_CHARS = 200;
+const FIRST_CHUNK_MIN_CHARS = 8;
+const FIRST_CHUNK_TARGET_CHARS = 48;
+const SOFT_CAP_CHARS = 75;
+const HARD_CAP_CHARS = 120;
 const ABBREV_RE = /\b(?:Dr|Mr|Mrs|Ms|Jr|Sr|St|vs|etc|e\.g|i\.e|No)$/i;
 
 function buildContext(input: {
@@ -150,6 +151,21 @@ function findBoundary(buf: string): number | null {
   return null;
 }
 
+function findEarlySpeechBoundary(buf: string, chunkIndex: number): number | null {
+  const target = chunkIndex === 0 ? FIRST_CHUNK_TARGET_CHARS : SOFT_CAP_CHARS;
+  if (buf.length < target) return null;
+
+  const punctuation = [",", ";", ":"];
+  for (const mark of punctuation) {
+    const idx = buf.indexOf(mark, Math.max(FIRST_CHUNK_MIN_CHARS, target - 24));
+    if (idx >= 0 && idx <= Math.min(buf.length - 1, target + 24)) return idx + 1;
+  }
+
+  const space = buf.lastIndexOf(" ", Math.min(buf.length - 1, target + 24));
+  if (space >= FIRST_CHUNK_MIN_CHARS) return space + 1;
+  return null;
+}
+
 export async function* answerStream(input: AnswerStreamInput): AsyncGenerator<SentenceChunk> {
   if (!input.openaiKey) throw new Error("OPENAI_API_KEY missing");
   if (!input.question.trim()) {
@@ -199,7 +215,7 @@ export async function* answerStream(input: AnswerStreamInput): AsyncGenerator<Se
     buf += delta;
 
     while (true) {
-      let cut: number | null = findBoundary(buf);
+      let cut: number | null = findBoundary(buf) ?? findEarlySpeechBoundary(buf, index);
       let forced = false;
 
       if (cut === null) {
