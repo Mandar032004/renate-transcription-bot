@@ -21,14 +21,15 @@ const schema = z.object({
   SARVAM_API_KEY: z.string().default(""),
   BRAIN_PATH: z.string().default("/brain/brain.docx"),
   WAKE_WORD: z.string().default("renate"),
-  VA_SETTLE_MS: z.coerce.number().default(500),
+  VA_SETTLE_MS: z.coerce.number().default(350),
   VA_MAX_QUESTION_MS: z.coerce.number().default(5000),
-  VA_COOLDOWN_MS: z.coerce.number().default(1500),
+  VA_COOLDOWN_MS: z.coerce.number().default(400),
+  VA_ENGAGED_WINDOW_MS: z.coerce.number().default(180_000),
   VA_STREAMING: z
     .string()
     .default("true")
     .transform((v) => v === "true"),
-  VA_ANSWER_MAX_TOKENS: z.coerce.number().default(180),
+  VA_ANSWER_MAX_TOKENS: z.coerce.number().default(120),
   MIC_SINK: z.string().default("mic_sink"),
   FAKE_MIC_PATH: z.string().default("/tmp/fake-mic.wav"),
   TTS_LANGUAGE: z.string().default("en-IN"),

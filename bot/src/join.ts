@@ -106,7 +106,7 @@ export async function joinMeet(opts: JoinOptions): Promise<JoinResult> {
     // not just check once.
     const joinButton = await waitForVisible(
       page,
-      [selectors.joinNowButton, selectors.askToJoinButton],
+      [selectors.joinNowButton, selectors.joinHereTooButton, selectors.askToJoinButton],
       joinTimeout
     );
     if (!joinButton) {

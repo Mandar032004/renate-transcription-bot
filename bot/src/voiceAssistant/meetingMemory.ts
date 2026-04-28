@@ -4,6 +4,7 @@ export interface MeetingMemoryInput {
   displayName: string;
   maxCaptions?: number;
   maxFacts?: number;
+  engagedWindowMs?: number;
 }
 
 export interface MeetingContext {
@@ -22,13 +23,20 @@ interface MemoryCaption {
 const QUESTION_RE = /\b(what|why|how|when|where|who|which|can|could|should|would|do|does|did|is|are|will)\b/i;
 const FACT_RE =
   /\b(decided|agreed|need|needs|blocker|blocked|deadline|pricing|price|customer|client|candidate|interview|hire|hiring|role|requirement|integration|policy|plan|next|action|follow up|follow-up)\b/i;
+const FOLLOW_UP_RE =
+  /^(and|also|then|so|but|what about|how about|tell me|give me|walk me|explain|compare|summarize|list|remind me)\b/i;
+const DIRECT_ADDRESS_RE = /\b(renate|you|your)\b/i;
+const IMPERATIVE_RE =
+  /^(tell|explain|summarize|compare|list|walk|give|share|help|remind|clarify)\b/i;
 
 export class MeetingMemory {
   private readonly captions: MemoryCaption[] = [];
   private readonly facts: string[] = [];
   private previousAnswer = "";
   private lastHumanSpeaker = "";
+  private lastAsker = "";
   private lastInteractionAt = 0;
+  private engagedUntil = 0;
 
   constructor(private readonly input: MeetingMemoryInput) {}
 
@@ -64,18 +72,46 @@ export class MeetingMemory {
     }
   }
 
-  markInteraction(speaker: string, answer: string): void {
-    this.lastInteractionAt = Date.now();
-    this.lastHumanSpeaker = speaker || this.lastHumanSpeaker;
-    this.previousAnswer = cleanText(answer).slice(0, 900);
+  activateConversation(speaker: string): void {
+    const now = Date.now();
+    if (speaker) {
+      this.lastHumanSpeaker = speaker;
+      this.lastAsker = speaker;
+    }
+    this.engagedUntil = Math.max(this.engagedUntil, now + (this.input.engagedWindowMs ?? 180_000));
   }
 
-  canTreatAsFollowUp(caption: DomCaption, windowMs = 25_000): boolean {
-    if (!this.lastInteractionAt || Date.now() - this.lastInteractionAt > windowMs) return false;
-    if (!caption.speaker || caption.speaker !== this.lastHumanSpeaker) return false;
+  markInteraction(speaker: string, answer: string): void {
+    const now = Date.now();
+    this.lastInteractionAt = now;
+    this.lastHumanSpeaker = speaker || this.lastHumanSpeaker;
+    this.lastAsker = speaker || this.lastAsker;
+    this.previousAnswer = cleanText(answer).slice(0, 900);
+    this.engagedUntil = Math.max(this.engagedUntil, now + (this.input.engagedWindowMs ?? 180_000));
+  }
+
+  isConversationActive(): boolean {
+    return this.engagedUntil > Date.now();
+  }
+
+  canTreatAsFollowUp(caption: DomCaption): boolean {
+    if (!this.isConversationActive()) return false;
+    if (!caption.speaker) return false;
     const text = cleanText(caption.text);
-    if (text.length < 6) return false;
-    return QUESTION_RE.test(text) || /^(and|also|then|so|but|what about|how about)\b/i.test(text);
+    if (text.length < 4) return false;
+
+    const sameSpeaker = caption.speaker === this.lastAsker;
+    const questionLike =
+      text.includes("?") ||
+      QUESTION_RE.test(text) ||
+      FOLLOW_UP_RE.test(text) ||
+      IMPERATIVE_RE.test(text);
+
+    if (!questionLike) return false;
+    if (sameSpeaker) return true;
+    if (DIRECT_ADDRESS_RE.test(text)) return true;
+    if (this.lastInteractionAt && Date.now() - this.lastInteractionAt <= 15_000) return true;
+    return false;
   }
 
   contextFor(question: string): MeetingContext {

@@ -245,14 +245,15 @@ async function enableCaptions(page: Page): Promise<void> {
     if (!sawInCallSignal) {
       const inCall = await page
         .evaluate(
-          ({ peopleSel, ccSel }) => {
+          ({ peopleSel, ccSel, leaveSel }) => {
             const q = (sel: string) =>
               sel.split(",").some((s) => !!document.querySelector(s.trim()));
-            return q(peopleSel) || q(ccSel);
+            return q(peopleSel) || q(ccSel) || q(leaveSel);
           },
           {
             peopleSel: selectors.peoplePanelButton,
             ccSel: selectors.captionsToggleButton,
+            leaveSel: selectors.leaveCallButton,
           }
         )
         .catch(() => false);

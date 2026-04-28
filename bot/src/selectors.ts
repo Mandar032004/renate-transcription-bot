@@ -18,8 +18,12 @@ export const selectors = {
 
   // Join button. Workspace meetings show "Join now" for invited attendees,
   // "Ask to join" for knock-to-join. We try both.
-  joinNowButton: 'button:has-text("Join now")',
-  askToJoinButton: 'button:has-text("Ask to join")',
+  joinNowButton:
+    'button:has-text("Join now"), [role="button"]:has-text("Join now")',
+  joinHereTooButton:
+    'button:has-text("Join here too"), [role="button"]:has-text("Join here too")',
+  askToJoinButton:
+    'button:has-text("Ask to join"), [role="button"]:has-text("Ask to join")',
 
   // Post-join: the persistent "Leave call" button. This is the most reliable
   // join-success signal.
@@ -34,7 +38,8 @@ export const selectors = {
   // "on"/"off" prefix). Match on the substring only, case-insensitive.
   // Note: `*="aptions"` (no leading c) is intentional — covers "Turn on
   // captions" / "Turn off captions" / "Captions" equally.
-  captionsToggleButton: 'button[aria-label*="aptions" i]',
+  captionsToggleButton:
+    'button[aria-label*="aptions" i], [role="button"][aria-label*="aptions" i]',
 
   // Caption container — specific Meet selectors first. We dropped the
   // generic `[aria-live="polite"]` fallback because it matches throwaway

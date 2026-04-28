@@ -24,6 +24,7 @@ export interface VoiceAssistantOptions {
   settleMs: number;
   maxQuestionMs: number;
   cooldownMs: number;
+  engagedWindowMs: number;
   ttsLanguage: string;
   ttsSpeaker: string;
   ttsModel: string;
@@ -59,7 +60,10 @@ export async function createVoiceAssistant(
   opts: VoiceAssistantOptions
 ): Promise<VoiceAssistant> {
   const brain = await loadBrain(opts.brainPath);
-  const memory = new MeetingMemory({ displayName: opts.displayName });
+  const memory = new MeetingMemory({
+    displayName: opts.displayName,
+    engagedWindowMs: opts.engagedWindowMs,
+  });
 
   let state: VaState = "IDLE";
   let accumulator: QuestionAccumulator | null = null;
@@ -116,6 +120,9 @@ export async function createVoiceAssistant(
     }
 
     if (reply && !runAbort.signal.aborted) memory.markInteraction(speaker, reply);
+    if ((timings.audioStartMs ?? Number.POSITIVE_INFINITY) > 3_000) {
+      log.warn({ timings }, "va first audio exceeded 3s target");
+    }
     log.info({ timings }, "va timings");
 
     if (runAbort.signal.aborted) {
@@ -366,14 +373,17 @@ export async function createVoiceAssistant(
           setState("IDLE");
           return;
         }
-        if (match.matched || isLikelyQuestion(c.text)) {
+        if (match.matched || memory.canTreatAsFollowUp(c)) {
           log.info(
             { speaker: c.speaker, text: c.text, wake: match.matched },
             "human interruption question received"
           );
           activeInterrupt = "question";
           activeAbort?.abort();
-          beginAccumulating(c, match.matched ? "wake word fired" : "interrupt question accepted");
+          beginAccumulating(c, match.matched ? "wake word fired" : "interrupt question accepted", {
+            tail: match.tail,
+            followUp: !match.matched,
+          });
           return;
         }
       }
@@ -431,12 +441,17 @@ export async function createVoiceAssistant(
   function beginAccumulating(
     c: DomCaption,
     msg: string,
-    extra: Record<string, unknown> = {}
+    extra: Record<string, unknown> & { tail?: string; followUp?: boolean } = {}
   ): void {
     setState("ACCUMULATING");
     accumulator?.cancel();
+    memory.activateConversation(c.speaker);
+    const settleMs =
+      extra.followUp || (extra.tail?.trim().length ?? 0) > 0
+        ? Math.max(220, Math.floor(opts.settleMs * 0.7))
+        : opts.settleMs;
     accumulator = new QuestionAccumulator({
-      settleMs: opts.settleMs,
+      settleMs,
       maxQuestionMs: opts.maxQuestionMs,
       onSettle: (q, meta) => {
         log.info({ question: q, settleReason: meta.reason }, "va question (post-settle)");
@@ -473,14 +488,6 @@ function waitInterruptible(ms: number, signal: AbortSignal): Promise<void> {
 function isStopCommand(text: string): boolean {
   const normalized = text.toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
   return /^(stop|stop it|renate stop|hey renate stop|okay stop|ok stop|enough|cancel|be quiet|mute)$/.test(
-    normalized
-  );
-}
-
-function isLikelyQuestion(text: string): boolean {
-  const normalized = text.toLowerCase().trim();
-  if (normalized.includes("?")) return true;
-  return /\b(what|why|how|when|where|who|which|can|could|should|would|do|does|did|is|are|will)\b/.test(
     normalized
   );
 }

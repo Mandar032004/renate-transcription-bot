@@ -75,6 +75,7 @@ async function main() {
             settleMs: cfg.VA_SETTLE_MS,
             maxQuestionMs: cfg.VA_MAX_QUESTION_MS,
             cooldownMs: cfg.VA_COOLDOWN_MS,
+            engagedWindowMs: cfg.VA_ENGAGED_WINDOW_MS,
             ttsLanguage: cfg.TTS_LANGUAGE,
             ttsSpeaker: cfg.TTS_SPEAKER,
             ttsModel: cfg.TTS_MODEL,
