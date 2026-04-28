@@ -10,6 +10,7 @@ const HARD_LIMIT_BYTES = 500_000;
 const CHUNK_TARGET_CHARS = 900;
 const CHUNK_OVERLAP_CHARS = 120;
 const MAX_RETRIEVAL_CHARS = 4_000;
+const COMPANY_OVERVIEW_CHUNKS = 3;
 
 export interface BrainChunk {
   id: number;
@@ -71,26 +72,38 @@ export async function loadBrain(path: string): Promise<BrainKnowledge> {
 }
 
 export function retrieveBrain(input: BrainKnowledge, query: string): RetrievedBrain {
-  const queryTerms = tokenize(query);
+  const signals = detectQuerySignals(query);
+  const expandedQuery = expandQuery(query, signals);
+  const queryTerms = tokenize(expandedQuery);
   if (queryTerms.size === 0) {
+    const fallback = signals.companyQuestion
+      ? input.chunks.slice(0, COMPANY_OVERVIEW_CHUNKS)
+      : input.chunks.slice(0, 3);
     return {
-      text: input.chunks.slice(0, 3).map(formatChunk).join("\n\n"),
-      chunkIds: input.chunks.slice(0, 3).map((c) => c.id),
-      scores: input.chunks.slice(0, 3).map(() => 0),
+      text: fallback.map(formatChunk).join("\n\n"),
+      chunkIds: fallback.map((c) => c.id),
+      scores: fallback.map(() => 0),
     };
   }
 
   const ranked = input.chunks
     .map((chunk) => ({
       chunk,
-      score: scoreChunk(chunk, queryTerms, query),
+      score: scoreChunk(chunk, queryTerms, expandedQuery, signals),
     }))
     .filter((x) => x.score > 0)
     .sort((a, b) => b.score - a.score || a.chunk.id - b.chunk.id);
 
-  const selected = ranked.slice(0, 6);
+  const selected = mergeWithOverview(input.chunks, ranked.slice(0, 6), signals);
   if (selected.length === 0) {
-    return { text: "", chunkIds: [], scores: [] };
+    if (!signals.companyQuestion) return { text: "", chunkIds: [], scores: [] };
+
+    const fallback = input.chunks.slice(0, COMPANY_OVERVIEW_CHUNKS);
+    return {
+      text: fallback.map(formatChunk).join("\n\n"),
+      chunkIds: fallback.map((c) => c.id),
+      scores: fallback.map(() => 0),
+    };
   }
 
   const parts: string[] = [];
@@ -139,7 +152,12 @@ function chunkBrain(text: string): BrainChunk[] {
   }));
 }
 
-function scoreChunk(chunk: BrainChunk, queryTerms: Set<string>, rawQuery: string): number {
+function scoreChunk(
+  chunk: BrainChunk,
+  queryTerms: Set<string>,
+  rawQuery: string,
+  signals: QuerySignals
+): number {
   let score = 0;
   for (const term of queryTerms) {
     if (chunk.terms.has(term)) score += term.length > 5 ? 2 : 1;
@@ -154,7 +172,92 @@ function scoreChunk(chunk: BrainChunk, queryTerms: Set<string>, rawQuery: string
     if (normalizedChunk.includes(phrase)) score += 2.5;
   }
 
+  if (signals.companyQuestion && chunk.id <= COMPANY_OVERVIEW_CHUNKS) score += 1.5;
+
   return score;
+}
+
+interface QuerySignals {
+  companyQuestion: boolean;
+  comparison: boolean;
+  overview: boolean;
+  workflow: boolean;
+  outcomes: boolean;
+}
+
+function detectQuerySignals(query: string): QuerySignals {
+  const normalized = normalize(query);
+  const companyQuestion =
+    /\brenate\b/.test(normalized) ||
+    /\b(ai recruiter|recruit(?:ing|ment)? agent|recruit(?:ing|ment)|hiring)\b/.test(normalized);
+
+  return {
+    companyQuestion,
+    comparison:
+      /\b(compare|compared|comparison|better|best|different|difference|choose|prefer|advantage)\b/.test(
+        normalized
+      ),
+    overview:
+      companyQuestion &&
+      /\b(what|who|how|why|tell|about|does|do)\b/.test(normalized),
+    workflow:
+      /\b(work|works|workflow|process|screen|screening|source|sourcing|shortlist|interview|call|schedule)\b/.test(
+        normalized
+      ),
+    outcomes:
+      /\b(best|better|benefit|benefits|value|worth|hours|weeks|faster|bias|audit|verification)\b/.test(
+        normalized
+      ),
+  };
+}
+
+function expandQuery(query: string, signals: QuerySignals): string {
+  const additions: string[] = [];
+
+  if (signals.overview) {
+    additions.push(
+      "sources screens scores interviews verifies shortlists schedules notes autonomous recruiter"
+    );
+  }
+  if (signals.workflow) {
+    additions.push(
+      "job profile sourcing parsing scoring ranking voice interview transcript shortlist scheduling"
+    );
+  }
+  if (signals.comparison || signals.outcomes) {
+    additions.push(
+      "hours not weeks evidence backed verification fewer bad hires zero scheduling overhead audit trail active sourcing"
+    );
+  }
+
+  return [query, ...additions].filter(Boolean).join(" ");
+}
+
+function mergeWithOverview(
+  chunks: BrainChunk[],
+  ranked: Array<{ chunk: BrainChunk; score: number }>,
+  signals: QuerySignals
+): Array<{ chunk: BrainChunk; score: number }> {
+  if (!signals.companyQuestion) return ranked;
+
+  const merged: Array<{ chunk: BrainChunk; score: number }> = [];
+  const seen = new Set<number>();
+
+  const add = (item: { chunk: BrainChunk; score: number }) => {
+    if (seen.has(item.chunk.id)) return;
+    seen.add(item.chunk.id);
+    merged.push(item);
+  };
+
+  if (signals.overview || signals.comparison || signals.outcomes) {
+    for (const chunk of chunks.slice(0, COMPANY_OVERVIEW_CHUNKS)) {
+      const rankedMatch = ranked.find((item) => item.chunk.id === chunk.id);
+      add(rankedMatch ?? { chunk, score: 0.5 });
+    }
+  }
+
+  for (const item of ranked) add(item);
+  return merged.slice(0, 6);
 }
 
 function formatChunk(chunk: BrainChunk): string {

@@ -56,6 +56,29 @@ type Timings = {
 };
 type MsFn = (t?: number) => number;
 
+interface ActiveReplyState {
+  question: string;
+  asker: string;
+  chunks: string[];
+  playedCount: number;
+  finalReply: string;
+  complete: boolean;
+}
+
+type ResumeState =
+  | {
+      kind: "speak";
+      question: string;
+      asker: string;
+      remainingChunks: string[];
+      finalReply: string;
+    }
+  | {
+      kind: "rerun";
+      question: string;
+      asker: string;
+    };
+
 export async function createVoiceAssistant(
   opts: VoiceAssistantOptions
 ): Promise<VoiceAssistant> {
@@ -71,6 +94,9 @@ export async function createVoiceAssistant(
   let activeAbort: AbortController | null = null;
   let activeInterrupt: "stop" | "question" | null = null;
   let cooldownAbort: AbortController | null = null;
+  let activeReply: ActiveReplyState | null = null;
+  let resumeState: ResumeState | null = null;
+  let activeQuestionSource: { speaker: string; tStart: number } | null = null;
 
   const setState = (next: VaState) => {
     log.info({ from: state, to: next }, "va state");
@@ -99,6 +125,16 @@ export async function createVoiceAssistant(
       sentencesCount: 0,
       unmuted: false,
     };
+    const replyState: ActiveReplyState = {
+      question,
+      asker: speaker,
+      chunks: [],
+      playedCount: 0,
+      finalReply: "",
+      complete: false,
+    };
+    activeReply = replyState;
+    resumeState = null;
 
     setState("THINKING");
     let reply = "";
@@ -107,8 +143,8 @@ export async function createVoiceAssistant(
     activeInterrupt = null;
     try {
       reply = opts.streaming
-        ? await runStreaming(question, timings, ms, runAbort.signal, speaker)
-        : await runNonStreaming(question, timings, ms, runAbort.signal, speaker);
+        ? await runStreaming(question, timings, ms, runAbort.signal, speaker, replyState)
+        : await runNonStreaming(question, timings, ms, runAbort.signal, speaker, replyState);
     } catch (err) {
       if (runAbort.signal.aborted) {
         log.info({ interrupt: activeInterrupt, timings }, "va run aborted");
@@ -116,6 +152,10 @@ export async function createVoiceAssistant(
         log.error({ err, timings }, "va run failed");
       }
     } finally {
+      if (runAbort.signal.aborted && activeInterrupt === "stop") {
+        resumeState = buildResumeState(replyState);
+      }
+      if (activeReply === replyState) activeReply = null;
       if (activeAbort === runAbort) activeAbort = null;
     }
 
@@ -128,6 +168,7 @@ export async function createVoiceAssistant(
     if (runAbort.signal.aborted) {
       if (activeInterrupt === "stop") {
         activeInterrupt = null;
+        activeQuestionSource = null;
         if (!stopped && state !== "ACCUMULATING") setState("IDLE");
       }
       return;
@@ -140,7 +181,10 @@ export async function createVoiceAssistant(
     if (cooldownAbort === cAbort) cooldownAbort = null;
     // Guard so a wake-word that short-circuited cooldown (and already moved
     // us to IDLE → ACCUMULATING) does not get clobbered back to IDLE.
-    if (!stopped && state === "COOLDOWN") setState("IDLE");
+    if (!stopped && state === "COOLDOWN") {
+      activeQuestionSource = null;
+      setState("IDLE");
+    }
   };
 
   const runNonStreaming = async (
@@ -148,7 +192,8 @@ export async function createVoiceAssistant(
     timings: Timings,
     ms: MsFn,
     signal: AbortSignal,
-    asker: string
+    asker: string,
+    replyState: ActiveReplyState
   ): Promise<string> => {
     timings.llmStartMs = ms();
     let reply: string;
@@ -168,6 +213,10 @@ export async function createVoiceAssistant(
       return "";
     }
 
+    replyState.finalReply = reply;
+    replyState.complete = true;
+    replyState.chunks = splitReplyForResume(reply);
+
     log.info({ reply, llmMs: (timings.llmEndMs ?? 0) - (timings.llmStartMs ?? 0) }, "va reply");
     if (stopped) return reply;
 
@@ -186,7 +235,7 @@ export async function createVoiceAssistant(
         timings.ttsEndMs = ms();
         return w;
       }),
-      setMicMuted(opts.page, false).then((u) => {
+      safeSetMicMuted(opts.page, false).then((u) => {
         timings.unmuteEndMs = ms();
         return u;
       }),
@@ -198,7 +247,7 @@ export async function createVoiceAssistant(
     }
     timings.sentencesCount = 1;
     try {
-      await speak({
+      const spoke = await speak({
         page: opts.page,
         wav,
         micSink: opts.micSink,
@@ -211,6 +260,7 @@ export async function createVoiceAssistant(
           timings.audioEndMs = ms();
         },
       });
+      if (spoke && !signal.aborted) replyState.playedCount = replyState.chunks.length;
     } catch (err) {
       log.error({ err, timings }, "speak failed");
     }
@@ -222,11 +272,12 @@ export async function createVoiceAssistant(
     timings: Timings,
     ms: MsFn,
     signal: AbortSignal,
-    asker: string
+    asker: string,
+    replyState: ActiveReplyState
   ): Promise<string> => {
     timings.llmStartMs = ms();
     timings.unmuteStartMs = ms();
-    const unmutePromise = setMicMuted(opts.page, false).then((u) => {
+    const unmutePromise = safeSetMicMuted(opts.page, false).then((u) => {
       timings.unmuteEndMs = ms();
       return u;
     });
@@ -264,6 +315,7 @@ export async function createVoiceAssistant(
         }
 
         replyParts.push(chunk.text);
+        replyState.chunks.push(chunk.text);
         const idx = chunk.index;
         const ttsPromise = synthesize({
           text: chunk.text,
@@ -310,6 +362,7 @@ export async function createVoiceAssistant(
               signal
             );
             timings.sentencesCount++;
+            replyState.playedCount++;
           } catch (err) {
             log.error({ err, idx }, "sentence play failed");
             aborted = true;
@@ -329,12 +382,14 @@ export async function createVoiceAssistant(
 
     await playChain.catch(() => {});
     try {
-      await setMicMuted(opts.page, true);
+      await safeSetMicMuted(opts.page, true);
     } catch (err) {
       log.error({ err }, "re-mute failed");
     }
 
     const reply = replyParts.join(" ").replace(/\s+/g, " ").trim();
+    replyState.finalReply = reply;
+    replyState.complete = !aborted && timings.llmEndMs !== undefined;
     log.info(
       {
         reply,
@@ -362,8 +417,14 @@ export async function createVoiceAssistant(
       const isHuman = !!c.speaker && c.speaker !== opts.displayName && c.speaker !== "You";
       if (isHuman) memory.observe(c);
 
+      if (isHuman && state === "IDLE" && isResumeCommand(c.text) && resumeState) {
+        log.info({ speaker: c.speaker, text: c.text }, "resume command received");
+        memory.activateConversation(c.speaker);
+        void resumeInterrupted(c.speaker);
+        return;
+      }
+
       if (isHuman && (state === "THINKING" || state === "SPEAKING")) {
-        const match = matchWakeWord(c.text, opts.wakeWord);
         if (isStopCommand(c.text)) {
           log.info({ speaker: c.speaker, text: c.text }, "stop command received; aborting reply");
           activeInterrupt = "stop";
@@ -373,6 +434,8 @@ export async function createVoiceAssistant(
           setState("IDLE");
           return;
         }
+        if (isSameActiveUtterance(c)) return;
+        const match = matchWakeWord(c.text, opts.wakeWord);
         if (match.matched || memory.canTreatAsFollowUp(c)) {
           log.info(
             { speaker: c.speaker, text: c.text, wake: match.matched },
@@ -409,6 +472,9 @@ export async function createVoiceAssistant(
       if (!isHuman) return;
 
       if (state === "ACCUMULATING") {
+        if (activeQuestionSource && c.speaker === activeQuestionSource.speaker && c.tStart >= activeQuestionSource.tStart) {
+          activeQuestionSource = { speaker: c.speaker, tStart: c.tStart };
+        }
         accumulator?.feed(c);
         return;
       }
@@ -431,7 +497,7 @@ export async function createVoiceAssistant(
       accumulator?.cancel();
       accumulator = null;
       try {
-        await setMicMuted(opts.page, true);
+        await safeSetMicMuted(opts.page, true);
       } catch (err) {
         log.error({ err }, "shutdown mute failed");
       }
@@ -445,6 +511,7 @@ export async function createVoiceAssistant(
   ): void {
     setState("ACCUMULATING");
     accumulator?.cancel();
+    activeQuestionSource = { speaker: c.speaker, tStart: c.tStart };
     memory.activateConversation(c.speaker);
     const settleMs =
       extra.followUp || (extra.tail?.trim().length ?? 0) > 0
@@ -460,6 +527,163 @@ export async function createVoiceAssistant(
     });
     log.info({ speaker: c.speaker, ...extra }, msg);
     accumulator.start(c);
+  }
+
+  async function resumeInterrupted(speaker: string): Promise<void> {
+    const snapshot = resumeState;
+    if (!snapshot) return;
+    resumeState = null;
+
+    if (snapshot.kind === "rerun") {
+      await runAnswer(
+        snapshot.question,
+        { startAt: Date.now(), stopAt: Date.now(), reason: "settle" },
+        speaker
+      );
+      return;
+    }
+
+    const t0 = Date.now();
+    const ms = (t?: number) => (t ?? Date.now()) - t0;
+    const timings: Timings = {
+      settleMs: 0,
+      streaming: snapshot.remainingChunks.length > 1,
+      sentencesCount: 0,
+      unmuted: false,
+    };
+    const replyState: ActiveReplyState = {
+      question: snapshot.question,
+      asker: speaker,
+      chunks: [...snapshot.remainingChunks],
+      playedCount: 0,
+      finalReply: snapshot.finalReply,
+      complete: true,
+    };
+
+    activeReply = replyState;
+    setState("SPEAKING");
+    const runAbort = new AbortController();
+    activeAbort = runAbort;
+    activeInterrupt = null;
+
+    try {
+      await speakChunks(snapshot.remainingChunks, timings, ms, runAbort.signal, replyState);
+    } catch (err) {
+      if (runAbort.signal.aborted) {
+        log.info({ interrupt: activeInterrupt, timings }, "va resume aborted");
+      } else {
+        log.error({ err, timings }, "va resume failed");
+      }
+    } finally {
+      if (runAbort.signal.aborted && activeInterrupt === "stop") {
+        resumeState = buildResumeState(replyState);
+      }
+      if (activeReply === replyState) activeReply = null;
+      if (activeAbort === runAbort) activeAbort = null;
+    }
+
+    if (snapshot.finalReply && !runAbort.signal.aborted) {
+      memory.markInteraction(speaker, snapshot.finalReply);
+    }
+    if ((timings.audioStartMs ?? Number.POSITIVE_INFINITY) > 3_000) {
+      log.warn({ timings }, "va first audio exceeded 3s target");
+    }
+    log.info({ timings }, "va timings");
+
+    if (runAbort.signal.aborted) {
+      if (activeInterrupt === "stop") {
+        activeInterrupt = null;
+        activeQuestionSource = null;
+        if (!stopped && state !== "ACCUMULATING") setState("IDLE");
+      }
+      return;
+    }
+
+    setState("COOLDOWN");
+    const cAbort = new AbortController();
+    cooldownAbort = cAbort;
+    await waitInterruptible(opts.cooldownMs, cAbort.signal);
+    if (cooldownAbort === cAbort) cooldownAbort = null;
+    if (!stopped && state === "COOLDOWN") {
+      activeQuestionSource = null;
+      setState("IDLE");
+    }
+  }
+
+  async function speakChunks(
+    chunks: string[],
+    timings: Timings,
+    ms: MsFn,
+    signal: AbortSignal,
+    replyState: ActiveReplyState
+  ): Promise<void> {
+    if (chunks.length === 0) return;
+
+    timings.unmuteStartMs = ms();
+    const unmutePromise = safeSetMicMuted(opts.page, false).then((u) => {
+      timings.unmuteEndMs = ms();
+      return u;
+    });
+
+    const wavPromises = chunks.map((text, idx) => {
+      if (idx === 0 && timings.ttsStartMs === undefined) timings.ttsStartMs = ms();
+      return synthesize({
+        text,
+        apiKey: opts.sarvamKey,
+        languageCode: opts.ttsLanguage,
+        speaker: opts.ttsSpeaker,
+        model: opts.ttsModel,
+        signal,
+      }).then((wav) => {
+        if (idx === 0 && timings.ttsEndMs === undefined) timings.ttsEndMs = ms();
+        return wav;
+      });
+    });
+
+    const unmuted = await unmutePromise;
+    timings.unmuted = unmuted;
+    if (!unmuted) {
+      log.warn("could not unmute mic; skipping resumed speak");
+      return;
+    }
+
+    try {
+      for (let idx = 0; idx < chunks.length; idx++) {
+        const wav = await wavPromises[idx];
+        if (signal.aborted) break;
+        await playWavBuffer(
+          wav,
+          opts.micSink,
+          () => {
+            if (timings.audioStartMs === undefined) timings.audioStartMs = ms();
+          },
+          () => {
+            timings.audioEndMs = ms();
+          },
+          signal
+        );
+        timings.sentencesCount++;
+        replyState.playedCount++;
+      }
+    } finally {
+      await safeSetMicMuted(opts.page, true).catch((err) =>
+        log.error({ err }, "re-mute failed")
+      );
+    }
+  }
+
+  function isSameActiveUtterance(c: DomCaption): boolean {
+    return !!activeQuestionSource &&
+      c.speaker === activeQuestionSource.speaker &&
+      c.tStart === activeQuestionSource.tStart;
+  }
+
+  async function safeSetMicMuted(page: Page, muted: boolean): Promise<boolean> {
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      if (await setMicMuted(page, muted)) return true;
+      if (attempt < 2) await page.waitForTimeout(120);
+    }
+    return false;
   }
 }
 
@@ -486,8 +710,57 @@ function waitInterruptible(ms: number, signal: AbortSignal): Promise<void> {
 }
 
 function isStopCommand(text: string): boolean {
-  const normalized = text.toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
+  const normalized = normalizeCommand(text);
   return /^(stop|stop it|renate stop|hey renate stop|okay stop|ok stop|enough|cancel|be quiet|mute)$/.test(
     normalized
   );
+}
+
+function isResumeCommand(text: string): boolean {
+  const normalized = normalizeCommand(text);
+  return /^(resume|continue|go on|carry on|keep going|renate resume|renate continue)$/.test(
+    normalized
+  );
+}
+
+function normalizeCommand(text: string): string {
+  return text.toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function buildResumeState(replyState: ActiveReplyState): ResumeState | null {
+  const question = replyState.question.trim();
+  if (!question) return null;
+
+  if (replyState.complete) {
+    const remainingChunks = replyState.chunks
+      .slice(replyState.playedCount)
+      .map((chunk) => chunk.trim())
+      .filter(Boolean);
+    if (remainingChunks.length > 0) {
+      return {
+        kind: "speak",
+        question,
+        asker: replyState.asker,
+        remainingChunks,
+        finalReply: replyState.finalReply || replyState.chunks.join(" ").trim(),
+      };
+    }
+    return null;
+  }
+
+  return {
+    kind: "rerun",
+    question,
+    asker: replyState.asker,
+  };
+}
+
+function splitReplyForResume(text: string): string[] {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (!normalized) return [];
+  const parts = normalized
+    .match(/[^.!?]+(?:[.!?]+|$)/g)
+    ?.map((part) => part.trim())
+    .filter(Boolean);
+  return parts && parts.length ? parts : [normalized];
 }
