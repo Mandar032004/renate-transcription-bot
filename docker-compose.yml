@@ -61,8 +61,8 @@ services:
       # auth.json into each bot container it spawns.
       AUTH_HOST_PATH: ${PWD}/auth
       # Host-side path to the brain knowledge file; bind-mounted into each
-      # bot container at /brain/brain.docx when VA_ENABLED=true.
-      BRAIN_HOST_PATH: ${PWD}/brain.docx
+      # bot container at /brain/brain.md when VA_ENABLED=true.
+      BRAIN_HOST_PATH: ${PWD}/brain.md
     # Docker socket is mounted so the worker can `docker run` per-session
     # bot containers.
     volumes:
@@ -90,7 +90,7 @@ services:
     env_file: .env
     volumes:
       - ./auth:/auth:ro
-      - ./brain.docx:/brain/brain.docx:ro
+      - ./brain.md:/brain/brain.md:ro
     networks: [renate]
 
 volumes:

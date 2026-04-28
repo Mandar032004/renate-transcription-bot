@@ -15,6 +15,17 @@ export interface SynthesizeInput {
   signal?: AbortSignal;
 }
 
+// Sarvam's English voices pronounce "Renate" as three Italian syllables
+// (re-na-te). The brand should sound like "ren-ATE" (rhymes with "late"),
+// so we substitute a phonetic spelling before sending to TTS. The original
+// text is preserved for logs and meeting context.
+const RENATE_PRONUNCIATION = process.env.TTS_RENATE_PRONUNCIATION || "Ren-ate";
+
+function applyPronunciation(text: string): string {
+  if (!RENATE_PRONUNCIATION) return text;
+  return text.replace(/\bRenate\b/g, RENATE_PRONUNCIATION);
+}
+
 /**
  * Call Sarvam TTS. Returns the synthesized audio as a WAV buffer.
  * Sarvam returns base64-encoded WAV in `audios[0]`.
@@ -23,8 +34,9 @@ export async function synthesize(input: SynthesizeInput): Promise<Buffer> {
   if (!input.apiKey) throw new Error("SARVAM_API_KEY missing");
   if (!input.text.trim()) throw new Error("empty tts text");
 
+  const spokenText = applyPronunciation(input.text);
   const body = {
-    text: input.text,
+    text: spokenText,
     target_language_code: input.languageCode ?? "en-IN",
     speaker: input.speaker ?? "anushka",
     model: input.model ?? "bulbul:v2",

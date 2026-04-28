@@ -22,6 +22,8 @@ export interface VoiceAssistantOptions {
   displayName: string;
   micSink: string;
   settleMs: number;
+  settleMinMs: number;
+  settleMaxMs: number;
   maxQuestionMs: number;
   cooldownMs: number;
   engagedWindowMs: number;
@@ -435,15 +437,15 @@ export async function createVoiceAssistant(
           return;
         }
         if (isSameActiveUtterance(c)) return;
-        const match = matchWakeWord(c.text, opts.wakeWord);
-        if (match.matched || memory.canTreatAsFollowUp(c)) {
+        if (isMeaningfulInterruption(c.text)) {
+          const match = matchWakeWord(c.text, opts.wakeWord);
           log.info(
             { speaker: c.speaker, text: c.text, wake: match.matched },
-            "human interruption question received"
+            "human interruption received; barging in"
           );
           activeInterrupt = "question";
           activeAbort?.abort();
-          beginAccumulating(c, match.matched ? "wake word fired" : "interrupt question accepted", {
+          beginAccumulating(c, match.matched ? "wake word fired" : "barge-in caption accepted", {
             tail: match.tail,
             followUp: !match.matched,
           });
@@ -519,6 +521,8 @@ export async function createVoiceAssistant(
         : opts.settleMs;
     accumulator = new QuestionAccumulator({
       settleMs,
+      settleMinMs: opts.settleMinMs,
+      settleMaxMs: opts.settleMaxMs,
       maxQuestionMs: opts.maxQuestionMs,
       onSettle: (q, meta) => {
         log.info({ question: q, settleReason: meta.reason }, "va question (post-settle)");
@@ -711,9 +715,22 @@ function waitInterruptible(ms: number, signal: AbortSignal): Promise<void> {
 
 function isStopCommand(text: string): boolean {
   const normalized = normalizeCommand(text);
-  return /^(stop|stop it|renate stop|hey renate stop|okay stop|ok stop|enough|cancel|be quiet|mute)$/.test(
+  return /^(stop|stop it|stop please|please stop|renate stop|hey renate stop|okay stop|ok stop|wait|wait wait|hold on|hang on|pause|enough|that s enough|cancel|be quiet|quiet|shut up|shut up please|mute|hush)$/.test(
     normalized
   );
+}
+
+// Mid-reply barge-in admits any non-trivial human caption from anyone in the
+// room: matching the user's "I can interfere anytime" expectation. Filler
+// noise and bot-side captions are filtered out earlier; here we just guard
+// against zero-content captions that would otherwise turn into empty turns.
+function isMeaningfulInterruption(text: string): boolean {
+  const normalized = normalizeCommand(text);
+  if (normalized.length < 4) return false;
+  if (/^(uh|um|hmm|mm|mhm|yeah|yep|nope|no|ok|okay|right|sure|cool|nice|wow)$/.test(normalized)) {
+    return false;
+  }
+  return /[a-z0-9]/.test(normalized);
 }
 
 function isResumeCommand(text: string): boolean {

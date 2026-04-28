@@ -73,6 +73,8 @@ async function main() {
             displayName: cfg.DISPLAY_NAME,
             micSink: cfg.MIC_SINK,
             settleMs: cfg.VA_SETTLE_MS,
+            settleMinMs: cfg.VA_SETTLE_MIN_MS,
+            settleMaxMs: cfg.VA_SETTLE_MAX_MS,
             maxQuestionMs: cfg.VA_MAX_QUESTION_MS,
             cooldownMs: cfg.VA_COOLDOWN_MS,
             engagedWindowMs: cfg.VA_ENGAGED_WINDOW_MS,

@@ -7,7 +7,9 @@ export interface AccumulatorSettleMeta {
 }
 
 export interface AccumulatorOptions {
-  settleMs: number;       // idle time before we consider the question complete
+  settleMs: number;       // base idle time before we consider the question complete
+  settleMinMs?: number;   // floor when last caption ends with terminal punctuation
+  settleMaxMs?: number;   // ceiling when last caption ends mid-clause
   maxQuestionMs: number;  // hard cap from first wake-word hit
   onSettle: (question: string, meta: AccumulatorSettleMeta) => void;
 }
@@ -94,7 +96,37 @@ export class QuestionAccumulator {
 
   private armSettleTimer(): void {
     if (this.settleTimer) clearTimeout(this.settleTimer);
-    this.settleTimer = setTimeout(() => this.finish("settle"), this.opts.settleMs);
+    this.settleTimer = setTimeout(() => this.finish("settle"), this.computeSettleMs());
+  }
+
+  // Adaptive end-of-utterance window. Meet streams captions with frequent
+  // 300-500ms gaps mid-sentence while the speaker pauses to think, so a
+  // fixed short timer cuts people off. We bias the wait by the punctuation
+  // at the tail of the latest caption row: terminal stops mean the speaker
+  // is probably done; trailing connectives mean they almost certainly are
+  // not.
+  private computeSettleMs(): number {
+    const base = this.opts.settleMs;
+    const min = this.opts.settleMinMs ?? Math.max(300, Math.floor(base * 0.6));
+    const max = this.opts.settleMaxMs ?? Math.max(base, Math.floor(base * 1.4));
+
+    const lastKey = this.rowOrder[this.rowOrder.length - 1];
+    const tail = lastKey ? (this.rows.get(lastKey) ?? "").trim() : "";
+    if (!tail) return base;
+
+    if (/[.?!]["')\]]?$/.test(tail)) return min;
+
+    const lastWord = (tail.match(/[A-Za-z']+$/)?.[0] ?? "").toLowerCase();
+    const continuationWords = new Set([
+      "and", "or", "but", "so", "because", "the", "a", "an", "to", "of",
+      "for", "with", "in", "on", "at", "by", "from", "is", "are", "was",
+      "were", "i", "we", "you", "they", "he", "she", "if", "when", "while",
+      "that", "which", "who", "whom", "whose", "than", "then", "as",
+    ]);
+    if (continuationWords.has(lastWord)) return max;
+    if (tail.endsWith(",") || tail.endsWith(";") || tail.endsWith(":")) return max;
+
+    return base;
   }
 
   private finish(reason: AccumulatorSettleMeta["reason"]): void {

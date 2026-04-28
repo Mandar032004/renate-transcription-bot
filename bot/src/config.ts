@@ -19,10 +19,12 @@ const schema = z.object({
   OPENAI_API_KEY: z.string().default(""),
   OPENAI_ANSWER_MODEL: z.string().default("gpt-4.1-mini"),
   SARVAM_API_KEY: z.string().default(""),
-  BRAIN_PATH: z.string().default("/brain/brain.docx"),
+  BRAIN_PATH: z.string().default("/brain/brain.md"),
   WAKE_WORD: z.string().default("renate"),
-  VA_SETTLE_MS: z.coerce.number().default(250),
-  VA_MAX_QUESTION_MS: z.coerce.number().default(5000),
+  VA_SETTLE_MS: z.coerce.number().default(800),
+  VA_SETTLE_MAX_MS: z.coerce.number().default(1100),
+  VA_SETTLE_MIN_MS: z.coerce.number().default(500),
+  VA_MAX_QUESTION_MS: z.coerce.number().default(8000),
   VA_COOLDOWN_MS: z.coerce.number().default(400),
   VA_ENGAGED_WINDOW_MS: z.coerce.number().default(180_000),
   VA_STREAMING: z
@@ -35,6 +37,11 @@ const schema = z.object({
   TTS_LANGUAGE: z.string().default("en-IN"),
   TTS_SPEAKER: z.string().default("shubh"),
   TTS_MODEL: z.string().default("bulbul:v3"),
+  // Sarvam reads "Renate" as three Italian syllables ("re-na-te"). Override
+  // the spelling at synthesis time so the brand sounds like "ren-ATE"
+  // (rhymes with "late"). Keep this overridable so the user can A/B
+  // alternative phonetic spellings without rebuilding.
+  TTS_RENATE_PRONUNCIATION: z.string().default("Ren-ate"),
 });
 
 export type BotConfig = z.infer<typeof schema>;

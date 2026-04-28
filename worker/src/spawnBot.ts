@@ -40,7 +40,7 @@ export async function spawnBot(input: SpawnBotInput): Promise<SpawnBotResult> {
 
   const binds = [`${hostAuthFile}:/auth/auth.json:ro`];
   if (input.brainHostPath) {
-    binds.push(`${input.brainHostPath}:/brain/brain.docx:ro`);
+    binds.push(`${input.brainHostPath}:/brain/brain.md:ro`);
   }
 
   log.info(
