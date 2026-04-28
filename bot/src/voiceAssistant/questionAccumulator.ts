@@ -3,7 +3,7 @@ import type { DomCaption } from "../captions.js";
 export interface AccumulatorSettleMeta {
   stopAt: number;   // last caption update time — proxy for "user stopped speaking"
   startAt: number;  // time of the wake-word caption
-  reason: "settle" | "hard-cap";
+  reason: "settle" | "hard-cap" | "speaker-change";
 }
 
 export interface AccumulatorOptions {
@@ -52,10 +52,15 @@ export class QuestionAccumulator {
     this.hardTimer = setTimeout(() => this.finish("hard-cap"), this.opts.maxQuestionMs);
   }
 
-  /** Feed a subsequent caption. Only from the same speaker is accepted. */
+  /** Feed a subsequent caption. Different speakers end the turn early. */
   feed(caption: DomCaption): void {
     if (this.done) return;
-    if (caption.speaker !== this.speaker) return;
+    if (caption.speaker && caption.speaker !== this.speaker) {
+      // Different speaker chimed in — treat as end of the asker's turn instead
+      // of silently dropping the caption.
+      this.finish("speaker-change");
+      return;
+    }
     // Drop captions whose row pre-dates this question. Guards against stale
     // rows in Meet's panel leaking into the current utterance.
     if (caption.tStart < this.startedAt - 500) return;
@@ -68,6 +73,9 @@ export class QuestionAccumulator {
       this.rowOrder.push(rowKey);
     }
     this.lastUpdateAt = Date.now();
+    // Pure silence-based settle. Punctuation-based early-finish was tried but
+    // Meet's auto-punctuation fires `?` mid-utterance while the speaker is
+    // still talking, which cascaded into many aborted LLM calls.
     this.armSettleTimer();
   }
 
@@ -89,7 +97,7 @@ export class QuestionAccumulator {
     this.settleTimer = setTimeout(() => this.finish("settle"), this.opts.settleMs);
   }
 
-  private finish(reason: "settle" | "hard-cap"): void {
+  private finish(reason: AccumulatorSettleMeta["reason"]): void {
     if (this.done) return;
     this.done = true;
     if (this.settleTimer) clearTimeout(this.settleTimer);
@@ -110,3 +118,4 @@ export class QuestionAccumulator {
     });
   }
 }
+

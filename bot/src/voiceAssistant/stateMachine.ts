@@ -9,9 +9,8 @@ export function canAccept(state: VaState): boolean {
   return state === "IDLE";
 }
 
-export function suppressesCaptions(state: VaState): boolean {
-  // During SPEAKING and COOLDOWN, ignore ALL incoming captions — not just
-  // ones attributed to the bot — because Meet's caption carry-forward can
-  // mis-attribute the bot's own voice to a human speaker.
+export function suppressesAction(state: VaState): boolean {
+  // During SPEAKING and COOLDOWN, do not act on incoming captions (no new
+  // wake-word capture). They can still be observed for meeting memory.
   return state === "SPEAKING" || state === "COOLDOWN";
 }

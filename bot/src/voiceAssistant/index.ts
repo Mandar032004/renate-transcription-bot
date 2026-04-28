@@ -7,7 +7,7 @@ import { loadBrain } from "./brain.js";
 import { MeetingMemory } from "./meetingMemory.js";
 import { QuestionAccumulator, type AccumulatorSettleMeta } from "./questionAccumulator.js";
 import { speak, playWavBuffer } from "./speak.js";
-import { canAccept, suppressesCaptions, type VaState } from "./stateMachine.js";
+import { canAccept, suppressesAction, type VaState } from "./stateMachine.js";
 import { synthesize } from "./tts.js";
 import { matchWakeWord } from "./wakeWord.js";
 
@@ -66,6 +66,7 @@ export async function createVoiceAssistant(
   let stopped = false;
   let activeAbort: AbortController | null = null;
   let activeInterrupt: "stop" | "question" | null = null;
+  let cooldownAbort: AbortController | null = null;
 
   const setState = (next: VaState) => {
     log.info({ from: state, to: next }, "va state");
@@ -102,8 +103,8 @@ export async function createVoiceAssistant(
     activeInterrupt = null;
     try {
       reply = opts.streaming
-        ? await runStreaming(question, timings, ms, runAbort.signal)
-        : await runNonStreaming(question, timings, ms, runAbort.signal);
+        ? await runStreaming(question, timings, ms, runAbort.signal, speaker)
+        : await runNonStreaming(question, timings, ms, runAbort.signal, speaker);
     } catch (err) {
       if (runAbort.signal.aborted) {
         log.info({ interrupt: activeInterrupt, timings }, "va run aborted");
@@ -126,15 +127,21 @@ export async function createVoiceAssistant(
     }
 
     setState("COOLDOWN");
-    await new Promise((r) => setTimeout(r, opts.cooldownMs));
-    if (!stopped) setState("IDLE");
+    const cAbort = new AbortController();
+    cooldownAbort = cAbort;
+    await waitInterruptible(opts.cooldownMs, cAbort.signal);
+    if (cooldownAbort === cAbort) cooldownAbort = null;
+    // Guard so a wake-word that short-circuited cooldown (and already moved
+    // us to IDLE → ACCUMULATING) does not get clobbered back to IDLE.
+    if (!stopped && state === "COOLDOWN") setState("IDLE");
   };
 
   const runNonStreaming = async (
     question: string,
     timings: Timings,
     ms: MsFn,
-    signal: AbortSignal
+    signal: AbortSignal,
+    asker: string
   ): Promise<string> => {
     timings.llmStartMs = ms();
     let reply: string;
@@ -143,6 +150,7 @@ export async function createVoiceAssistant(
         question,
         brain,
         meetingContext: memory.contextFor(question),
+        asker,
         openaiKey: opts.openaiKey,
         model: opts.answerModel,
         maxTokens: opts.answerMaxTokens,
@@ -206,7 +214,8 @@ export async function createVoiceAssistant(
     question: string,
     timings: Timings,
     ms: MsFn,
-    signal: AbortSignal
+    signal: AbortSignal,
+    asker: string
   ): Promise<string> => {
     timings.llmStartMs = ms();
     timings.unmuteStartMs = ms();
@@ -228,6 +237,7 @@ export async function createVoiceAssistant(
       question,
       brain,
       meetingContext: memory.contextFor(question),
+      asker,
       openaiKey: opts.openaiKey,
       model: opts.answerModel,
       maxTokens: opts.answerMaxTokens,
@@ -368,7 +378,24 @@ export async function createVoiceAssistant(
         }
       }
 
-      if (suppressesCaptions(state)) return;
+      // During COOLDOWN, allow a fresh wake-word or a same-speaker follow-up
+      // to short-circuit the wait, so back-to-back questions feel natural
+      // instead of the bot ignoring you for a fixed window.
+      if (state === "COOLDOWN" && isHuman) {
+        const cdMatch = matchWakeWord(c.text, opts.wakeWord);
+        const cdFollowUp = !cdMatch.matched && memory.canTreatAsFollowUp(c);
+        if (cdMatch.matched || cdFollowUp) {
+          log.info(
+            { speaker: c.speaker, wake: cdMatch.matched, followUp: cdFollowUp },
+            "short-circuiting cooldown"
+          );
+          cooldownAbort?.abort();
+          setState("IDLE");
+          // Fall through to the IDLE handling below.
+        }
+      }
+
+      if (suppressesAction(state)) return;
       if (!isHuman) return;
 
       if (state === "ACCUMULATING") {
@@ -390,6 +417,7 @@ export async function createVoiceAssistant(
     async stop() {
       stopped = true;
       activeAbort?.abort();
+      cooldownAbort?.abort();
       accumulator?.cancel();
       accumulator = null;
       try {
@@ -422,6 +450,24 @@ export async function createVoiceAssistant(
 
 function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function waitInterruptible(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) {
+      resolve();
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(t);
+      resolve();
+    };
+    const t = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 function isStopCommand(text: string): boolean {
