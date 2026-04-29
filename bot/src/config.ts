@@ -32,6 +32,27 @@ const schema = z.object({
     .default("true")
     .transform((v) => v === "true"),
   VA_ANSWER_MAX_TOKENS: z.coerce.number().default(120),
+  VA_ANSWER_TEMPERATURE: z.coerce.number().default(0.2),
+  // Comma-separated phrase lists. Matched as substrings against normalized
+  // captions, so longer natural utterances ("please stop talking", "yeah
+  // continue please") still trigger.
+  VA_STOP_PHRASES: z
+    .string()
+    .default(
+      "stop,stop it,stop talking,please stop,okay stop,ok stop,wait,hold on,hang on,pause,enough,that's enough,that is enough,no more,cancel,quiet,be quiet,shut up,mute,hush,renate stop,okay renate stop"
+    ),
+  VA_RESUME_PHRASES: z
+    .string()
+    .default(
+      "continue,please continue,go on,carry on,keep going,keep talking,resume,what were you saying,where were we,pick up where you left off,go ahead,back to it,you were saying"
+    ),
+  // When false, the model's previous reply is NOT re-injected as
+  // <previous_answer>. This breaks the hallucination amplifier loop where a
+  // wrong answer in turn N becomes "context" the model trusts in turn N+1.
+  VA_USE_PREVIOUS_ANSWER: z
+    .string()
+    .default("false")
+    .transform((v) => v === "true"),
   MIC_SINK: z.string().default("mic_sink"),
   FAKE_MIC_PATH: z.string().default("/tmp/fake-mic.wav"),
   TTS_LANGUAGE: z.string().default("en-IN"),
@@ -39,9 +60,11 @@ const schema = z.object({
   TTS_MODEL: z.string().default("bulbul:v3"),
   // Sarvam reads "Renate" as three Italian syllables ("re-na-te"). Override
   // the spelling at synthesis time so the brand sounds like "ren-ATE"
-  // (rhymes with "late"). Keep this overridable so the user can A/B
-  // alternative phonetic spellings without rebuilding.
-  TTS_RENATE_PRONUNCIATION: z.string().default("Ren-ate"),
+  // (rhymes with "late"). Bulbul stresses the first syllable reliably on
+  // doubled-consonant patterns ("Rennate"), whereas a hyphen is read
+  // inconsistently. Keep this overridable so the user can A/B alternative
+  // phonetic spellings without rebuilding.
+  TTS_RENATE_PRONUNCIATION: z.string().default("Rennate"),
 });
 
 export type BotConfig = z.infer<typeof schema>;

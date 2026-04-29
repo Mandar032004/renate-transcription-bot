@@ -45,6 +45,11 @@ async function main() {
             TTS_LANGUAGE: cfg.TTS_LANGUAGE,
             TTS_SPEAKER: cfg.TTS_SPEAKER,
             TTS_MODEL: cfg.TTS_MODEL,
+            TTS_RENATE_PRONUNCIATION: cfg.TTS_RENATE_PRONUNCIATION,
+            ...(cfg.VA_STOP_PHRASES ? { VA_STOP_PHRASES: cfg.VA_STOP_PHRASES } : {}),
+            ...(cfg.VA_RESUME_PHRASES ? { VA_RESUME_PHRASES: cfg.VA_RESUME_PHRASES } : {}),
+            ...(cfg.VA_ANSWER_TEMPERATURE ? { VA_ANSWER_TEMPERATURE: cfg.VA_ANSWER_TEMPERATURE } : {}),
+            ...(cfg.VA_USE_PREVIOUS_ANSWER ? { VA_USE_PREVIOUS_ANSWER: cfg.VA_USE_PREVIOUS_ANSWER } : {}),
           },
         });
       },

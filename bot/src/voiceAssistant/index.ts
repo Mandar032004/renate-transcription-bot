@@ -32,6 +32,9 @@ export interface VoiceAssistantOptions {
   ttsModel: string;
   answerModel: string;
   answerMaxTokens: number;
+  answerTemperature: number;
+  stopPhrases: string[];
+  resumePhrases: string[];
   streaming: boolean;
 }
 
@@ -76,9 +79,13 @@ type ResumeState =
       finalReply: string;
     }
   | {
-      kind: "rerun";
+      // Used when the LLM was cut off mid-stream. We call the model again
+      // with the text the user already heard so it picks up where it left
+      // off instead of restarting with a fresh, possibly-different answer.
+      kind: "continue";
       question: string;
       asker: string;
+      partialText: string;
     };
 
 export async function createVoiceAssistant(
@@ -108,7 +115,8 @@ export async function createVoiceAssistant(
   const runAnswer = async (
     question: string,
     meta: AccumulatorSettleMeta,
-    speaker: string
+    speaker: string,
+    partialAnswer?: string
   ) => {
     accumulator = null;
     const cleaned = question.trim();
@@ -132,7 +140,7 @@ export async function createVoiceAssistant(
       asker: speaker,
       chunks: [],
       playedCount: 0,
-      finalReply: "",
+      finalReply: partialAnswer ?? "",
       complete: false,
     };
     activeReply = replyState;
@@ -145,8 +153,8 @@ export async function createVoiceAssistant(
     activeInterrupt = null;
     try {
       reply = opts.streaming
-        ? await runStreaming(question, timings, ms, runAbort.signal, speaker, replyState)
-        : await runNonStreaming(question, timings, ms, runAbort.signal, speaker, replyState);
+        ? await runStreaming(question, timings, ms, runAbort.signal, speaker, replyState, partialAnswer)
+        : await runNonStreaming(question, timings, ms, runAbort.signal, speaker, replyState, partialAnswer);
     } catch (err) {
       if (runAbort.signal.aborted) {
         log.info({ interrupt: activeInterrupt, timings }, "va run aborted");
@@ -195,12 +203,13 @@ export async function createVoiceAssistant(
     ms: MsFn,
     signal: AbortSignal,
     asker: string,
-    replyState: ActiveReplyState
+    replyState: ActiveReplyState,
+    partialAnswer?: string
   ): Promise<string> => {
     timings.llmStartMs = ms();
-    let reply: string;
+    let continuation: string;
     try {
-      reply = await answer({
+      continuation = await answer({
         question,
         brain,
         meetingContext: memory.contextFor(question),
@@ -208,6 +217,8 @@ export async function createVoiceAssistant(
         openaiKey: opts.openaiKey,
         model: opts.answerModel,
         maxTokens: opts.answerMaxTokens,
+        temperature: opts.answerTemperature,
+        partialAnswer,
       });
       timings.llmEndMs = ms();
     } catch (err) {
@@ -215,19 +226,22 @@ export async function createVoiceAssistant(
       return "";
     }
 
-    replyState.finalReply = reply;
+    const fullReply = partialAnswer
+      ? `${partialAnswer.trim()} ${continuation}`.replace(/\s+/g, " ").trim()
+      : continuation;
+    replyState.finalReply = fullReply;
     replyState.complete = true;
-    replyState.chunks = splitReplyForResume(reply);
+    replyState.chunks = splitReplyForResume(continuation);
 
-    log.info({ reply, llmMs: (timings.llmEndMs ?? 0) - (timings.llmStartMs ?? 0) }, "va reply");
-    if (stopped) return reply;
+    log.info({ reply: fullReply, llmMs: (timings.llmEndMs ?? 0) - (timings.llmStartMs ?? 0) }, "va reply");
+    if (stopped) return fullReply;
 
     setState("SPEAKING");
     timings.ttsStartMs = ms();
     timings.unmuteStartMs = ms();
     const [wav, unmuted] = await Promise.all([
       synthesize({
-        text: reply,
+        text: continuation,
         apiKey: opts.sarvamKey,
         languageCode: opts.ttsLanguage,
         speaker: opts.ttsSpeaker,
@@ -245,7 +259,7 @@ export async function createVoiceAssistant(
     timings.unmuted = unmuted;
     if (!unmuted) {
       log.warn({ timings }, "could not unmute mic; skipping speak");
-      return reply;
+      return fullReply;
     }
     timings.sentencesCount = 1;
     try {
@@ -266,7 +280,7 @@ export async function createVoiceAssistant(
     } catch (err) {
       log.error({ err, timings }, "speak failed");
     }
-    return reply;
+    return fullReply;
   };
 
   const runStreaming = async (
@@ -275,7 +289,8 @@ export async function createVoiceAssistant(
     ms: MsFn,
     signal: AbortSignal,
     asker: string,
-    replyState: ActiveReplyState
+    replyState: ActiveReplyState,
+    partialAnswer?: string
   ): Promise<string> => {
     timings.llmStartMs = ms();
     timings.unmuteStartMs = ms();
@@ -301,6 +316,8 @@ export async function createVoiceAssistant(
       openaiKey: opts.openaiKey,
       model: opts.answerModel,
       maxTokens: opts.answerMaxTokens,
+      temperature: opts.answerTemperature,
+      partialAnswer,
       signal: ctrl.signal,
     });
 
@@ -389,7 +406,10 @@ export async function createVoiceAssistant(
       log.error({ err }, "re-mute failed");
     }
 
-    const reply = replyParts.join(" ").replace(/\s+/g, " ").trim();
+    const continuation = replyParts.join(" ").replace(/\s+/g, " ").trim();
+    const reply = partialAnswer
+      ? `${partialAnswer.trim()} ${continuation}`.replace(/\s+/g, " ").trim()
+      : continuation;
     replyState.finalReply = reply;
     replyState.complete = !aborted && timings.llmEndMs !== undefined;
     log.info(
@@ -419,23 +439,59 @@ export async function createVoiceAssistant(
       const isHuman = !!c.speaker && c.speaker !== opts.displayName && c.speaker !== "You";
       if (isHuman) memory.observe(c);
 
-      if (isHuman && state === "IDLE" && isResumeCommand(c.text) && resumeState) {
-        log.info({ speaker: c.speaker, text: c.text }, "resume command received");
-        memory.activateConversation(c.speaker);
-        void resumeInterrupted(c.speaker);
-        return;
+      // Resume can fire from IDLE (normal) or COOLDOWN (so the user doesn't
+      // have to wait out the cooldown window after a stop).
+      if (isHuman && resumeState && (state === "IDLE" || state === "COOLDOWN")) {
+        const resumeMatch = isResumeCommand(c.text, opts.resumePhrases);
+        if (resumeMatch) {
+          log.info(
+            { speaker: c.speaker, text: c.text, phrase: resumeMatch },
+            "va resume matched"
+          );
+          memory.activateConversation(c.speaker);
+          if (state === "COOLDOWN") {
+            cooldownAbort?.abort();
+            setState("IDLE");
+          }
+          void resumeInterrupted(c.speaker);
+          return;
+        }
+      }
+
+      // Stop fires from any active state. The user said "the bot should stop
+      // immediately" — that means accepting stop while we're still gathering
+      // the question (ACCUMULATING) and during the post-reply cooldown too,
+      // not only during THINKING/SPEAKING.
+      if (
+        isHuman &&
+        (state === "THINKING" ||
+          state === "SPEAKING" ||
+          state === "ACCUMULATING" ||
+          state === "COOLDOWN")
+      ) {
+        const stopMatch = isStopCommand(c.text, opts.stopPhrases);
+        if (stopMatch) {
+          log.info(
+            { speaker: c.speaker, text: c.text, fromState: state, phrase: stopMatch },
+            "va stop matched; aborting"
+          );
+          activeInterrupt = "stop";
+          activeAbort?.abort();
+          cooldownAbort?.abort();
+          accumulator?.cancel();
+          accumulator = null;
+          activeQuestionSource = null;
+          if (state === "ACCUMULATING" || state === "COOLDOWN") {
+            // Nothing to abort in these states (no in-flight reply), so we
+            // need to drop straight to IDLE here. THINKING/SPEAKING states
+            // unwind via the runAnswer finally block instead.
+            setState("IDLE");
+          }
+          return;
+        }
       }
 
       if (isHuman && (state === "THINKING" || state === "SPEAKING")) {
-        if (isStopCommand(c.text)) {
-          log.info({ speaker: c.speaker, text: c.text }, "stop command received; aborting reply");
-          activeInterrupt = "stop";
-          activeAbort?.abort();
-          accumulator?.cancel();
-          accumulator = null;
-          setState("IDLE");
-          return;
-        }
         if (isSameActiveUtterance(c)) return;
         if (isMeaningfulInterruption(c.text)) {
           const match = matchWakeWord(c.text, opts.wakeWord);
@@ -538,11 +594,16 @@ export async function createVoiceAssistant(
     if (!snapshot) return;
     resumeState = null;
 
-    if (snapshot.kind === "rerun") {
+    if (snapshot.kind === "continue") {
+      log.info(
+        { speaker, partialChars: snapshot.partialText.length },
+        "va resume (continuation)"
+      );
       await runAnswer(
         snapshot.question,
         { startAt: Date.now(), stopAt: Date.now(), reason: "settle" },
-        speaker
+        speaker,
+        snapshot.partialText
       );
       return;
     }
@@ -713,11 +774,28 @@ function waitInterruptible(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-function isStopCommand(text: string): boolean {
-  const normalized = normalizeCommand(text);
-  return /^(stop|stop it|stop please|please stop|renate stop|hey renate stop|okay stop|ok stop|wait|wait wait|hold on|hang on|pause|enough|that s enough|cancel|be quiet|quiet|shut up|shut up please|mute|hush)$/.test(
-    normalized
-  );
+// Substring matching against a normalized phrase list. The previous
+// anchored regex (`^stop$`) only fired on bare exact matches, so natural
+// phrasings like "please stop talking" or "yeah, continue please" were
+// dropped. We now match on token-bounded substrings so any caption that
+// CONTAINS a stop/resume phrase fires the action.
+function matchesPhrase(normalized: string, phrases: string[]): string | null {
+  if (!normalized) return null;
+  const padded = ` ${normalized} `;
+  for (const phrase of phrases) {
+    const p = phrase.trim().toLowerCase();
+    if (!p) continue;
+    if (padded.includes(` ${p} `)) return p;
+  }
+  return null;
+}
+
+function isStopCommand(text: string, phrases: string[]): string | null {
+  return matchesPhrase(normalizeCommand(text), phrases);
+}
+
+function isResumeCommand(text: string, phrases: string[]): string | null {
+  return matchesPhrase(normalizeCommand(text), phrases);
 }
 
 // Mid-reply barge-in admits any non-trivial human caption from anyone in the
@@ -731,13 +809,6 @@ function isMeaningfulInterruption(text: string): boolean {
     return false;
   }
   return /[a-z0-9]/.test(normalized);
-}
-
-function isResumeCommand(text: string): boolean {
-  const normalized = normalizeCommand(text);
-  return /^(resume|continue|go on|carry on|keep going|renate resume|renate continue)$/.test(
-    normalized
-  );
 }
 
 function normalizeCommand(text: string): string {
@@ -765,10 +836,22 @@ function buildResumeState(replyState: ActiveReplyState): ResumeState | null {
     return null;
   }
 
+  // LLM was still streaming when we got cut off. The user heard only the
+  // chunks fully played; everything else is buffered but unspoken. Use the
+  // played chunks as the "what you already said" anchor for the
+  // continuation prompt — that matches what the user actually heard.
+  const partialText = replyState.chunks
+    .slice(0, replyState.playedCount)
+    .map((chunk) => chunk.trim())
+    .filter(Boolean)
+    .join(" ")
+    .trim();
+
   return {
-    kind: "rerun",
+    kind: "continue",
     question,
     asker: replyState.asker,
+    partialText,
   };
 }
 

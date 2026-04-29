@@ -18,6 +18,11 @@ const schema = z.object({
   TTS_LANGUAGE: z.string().default("en-IN"),
   TTS_SPEAKER: z.string().default("anushka"),
   TTS_MODEL: z.string().default("bulbul:v2"),
+  TTS_RENATE_PRONUNCIATION: z.string().default("Rennate"),
+  VA_STOP_PHRASES: z.string().default(""),
+  VA_RESUME_PHRASES: z.string().default(""),
+  VA_ANSWER_TEMPERATURE: z.string().default(""),
+  VA_USE_PREVIOUS_ANSWER: z.string().default(""),
 });
 
 export type WorkerConfig = z.infer<typeof schema>;

@@ -83,6 +83,9 @@ async function main() {
             ttsModel: cfg.TTS_MODEL,
             answerModel: cfg.OPENAI_ANSWER_MODEL,
             answerMaxTokens: cfg.VA_ANSWER_MAX_TOKENS,
+            answerTemperature: cfg.VA_ANSWER_TEMPERATURE,
+            stopPhrases: parsePhraseList(cfg.VA_STOP_PHRASES),
+            resumePhrases: parsePhraseList(cfg.VA_RESUME_PHRASES),
             streaming: cfg.VA_STREAMING,
           });
           log.info({ wakeWord: cfg.WAKE_WORD }, "voice assistant ready");
@@ -112,6 +115,13 @@ async function main() {
     log.error({ err }, "bot: fatal during boot");
     await shutdown("ERROR", 1);
   }
+}
+
+function parsePhraseList(raw: string): string[] {
+  return raw
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter((s) => s.length > 0);
 }
 
 main().catch((err) => {

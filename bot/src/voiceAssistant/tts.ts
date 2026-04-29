@@ -19,11 +19,17 @@ export interface SynthesizeInput {
 // (re-na-te). The brand should sound like "ren-ATE" (rhymes with "late"),
 // so we substitute a phonetic spelling before sending to TTS. The original
 // text is preserved for logs and meeting context.
-const RENATE_PRONUNCIATION = process.env.TTS_RENATE_PRONUNCIATION || "Ren-ate";
+//
+// The regex is case-insensitive and covers possessive/plural forms because
+// the LLM occasionally lowercases the name and Meet ASR has emitted "RENATE"
+// in all-caps; without /i the per-chunk rewrite would silently miss those.
+const RENATE_PRONUNCIATION = process.env.TTS_RENATE_PRONUNCIATION || "Rennate";
 
-function applyPronunciation(text: string): string {
+export function applyPronunciation(text: string): string {
   if (!RENATE_PRONUNCIATION) return text;
-  return text.replace(/\bRenate\b/g, RENATE_PRONUNCIATION);
+  return text.replace(/\brenate('s|s)?\b/gi, (_match, suffix: string | undefined) =>
+    suffix ? `${RENATE_PRONUNCIATION}${suffix}` : RENATE_PRONUNCIATION
+  );
 }
 
 /**
